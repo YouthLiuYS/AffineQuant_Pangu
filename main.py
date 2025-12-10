@@ -5,6 +5,7 @@ import numpy as np
 from models.LMClass import LMClass
 import torch
 import time
+import math
 from datautils import get_loaders
 from lm_eval import evaluator
 from pprint import pprint
@@ -19,10 +20,10 @@ from categories import subcategories, categories
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_opt_layer import QuantOPTDecoderLayer
 from quantize.int_linear import QuantLinear
-try:
-    from llava.model import *   # required for llava
-except ImportError:
-    print("If want to quantize llave models, you should manually install llava from https://github.com/haotian-liu/LLaVA")
+# try:
+#     from llava.model import *   # required for llava
+# except ImportError:
+#     print("If want to quantize llave models, you should manually install llava from https://github.com/haotian-liu/LLaVA")
 
 import pdb
 import subprocess
@@ -392,6 +393,7 @@ def main():
     lm = LMClass(args)
     lm.seqlen = 2048
     lm.model.eval()
+    print("lm:  ", lm.model.state_dict())
     for param in lm.model.parameters():
         param.requires_grad = False
 
