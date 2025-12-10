@@ -6,3 +6,5 @@ cache
 .vscode
 *.pyc
 log
+opt-125m
+fake_quant_model
