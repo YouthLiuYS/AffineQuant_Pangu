@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from typing import Optional, Tuple, List
+import copy
 from quantize.int_linear import QuantLinear
 from quantize.int_matmul import QuantMatMul
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from collections import OrderedDict
 import pdb
 from models.models_utils import truncate_number
 from models.transformation import *
+import utils
 
 
 
@@ -43,23 +45,55 @@ class QuantOPTAttention(nn.Module):
         self.is_decoder = is_decoder
 
         # input is quantized by LayerNorm, set disable_input_quant=True
+        
+        current_layer_name = getattr(args, "current_layer_name", "")
+        group_size_config = args.weight_quant_params.get("group_size_config", {})
+        default_group_size = args.weight_quant_params.get("group_size")
+        
+        k_proj_params = copy.deepcopy(args.weight_quant_params)
+        k_proj_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.self_attn.k_proj", 
+            default_group_size
+        )
         self.k_proj = QuantLinear(
             org_module.k_proj,
-            args.weight_quant_params,
+            k_proj_params,
             args.act_quant_params,
+        )
+
+        v_proj_params = copy.deepcopy(args.weight_quant_params)
+        v_proj_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.self_attn.v_proj", 
+            default_group_size
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
-            args.weight_quant_params,
+            v_proj_params,
             args.act_quant_params,
+        )
+
+        q_proj_params = copy.deepcopy(args.weight_quant_params)
+        q_proj_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.self_attn.q_proj", 
+            default_group_size
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
-            args.weight_quant_params,
+            q_proj_params,
             args.act_quant_params,
         )
+
+        out_proj_params = copy.deepcopy(args.weight_quant_params)
+        out_proj_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.self_attn.out_proj", 
+            default_group_size
+        )
         self.out_proj = QuantLinear(
-            org_module.out_proj, args.weight_quant_params, args.act_quant_params
+            org_module.out_proj, out_proj_params, args.act_quant_params
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.bmm
@@ -250,14 +284,32 @@ class QuantOPTDecoderLayer(nn.Module):
         self.self_attn_layer_norm = AffineLayerNorm(
             ori_layer.self_attn_layer_norm
         )
+        
+        current_layer_name = getattr(args, "current_layer_name", "")
+        group_size_config = args.weight_quant_params.get("group_size_config", {})
+        default_group_size = args.weight_quant_params.get("group_size")
+
+        fc1_params = copy.deepcopy(args.weight_quant_params)
+        fc1_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.fc1", 
+            default_group_size
+        )
         self.fc1 = QuantLinear(
             ori_layer.fc1,
-            weight_quant_params=args.weight_quant_params,
+            weight_quant_params=fc1_params,
             act_quant_params=args.act_quant_params,
+        )
+
+        fc2_params = copy.deepcopy(args.weight_quant_params)
+        fc2_params["group_size"] = utils.get_group_size(
+            group_size_config, 
+            f"{current_layer_name}.fc2", 
+            default_group_size
         )
         self.fc2 = QuantLinear(
             ori_layer.fc2,
-            weight_quant_params=args.weight_quant_params,
+            weight_quant_params=fc2_params,
             act_quant_params=args.act_quant_params,
         )
         self.final_layer_norm = AffineLayerNorm(
