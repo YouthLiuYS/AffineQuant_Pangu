@@ -395,8 +395,16 @@ def main():
     logger.info(args)
 
     if args.use_wandb:
-        wandb.init(project=args.wandb_project, name=args.wandb_name, config=args)
-        logger.info(f"Initialized wandb with project: {args.wandb_project}, run name: {args.wandb_name}")
+        # Automatically add timestamp to wandb_name if provided
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if args.wandb_name:
+            run_name = f"{args.wandb_name}_{timestamp}"
+        else:
+            run_name = f"{args.net}_w{args.wbits}a{args.abits}_{timestamp}"
+        
+        wandb.init(project=args.wandb_project, name=run_name, config=args)
+        logger.info(f"Initialized wandb with project: {args.wandb_project}, run name: {run_name}")
     
     # load model
     if args.net is None:
