@@ -157,36 +157,12 @@ def affinequant(
     else:
         affine_parameters = {}
     
-    global_step = 0 # Initialize global step counter
-    # Dictionary to collect loss data for each layer: {layer_id: [(epoch, loss), ...]}
-    layer_loss_data = {}
-    # List to collect parameter data for bar chart: [(layer_index, scale_params, shift_params, total_trainable_params), ...]
-    all_layers_param_data = []
-    
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
         # Set current layer name for group_size configuration
         args.current_layer_name = f"{layer_name_prefix}.{i}"
         qlayer = DecoderLayer(lm.model.config, layer, args)
-
-        # --- Calculate Initial Spectral Norms ---
-        init_sn = {}
-        with torch.no_grad():
-            for n, m in qlayer.named_modules():
-                if isinstance(m, QuantLinear):
-                    try:
-                        # Spectral norm is the largest singular value (2-norm)
-                        sn = torch.linalg.norm(m.weight.float(), ord=2).item()
-                        init_sn[n] = sn
-                    except Exception as e:
-                        logger.warning(f"Failed to calc spectral norm for {n}: {e}")
-            logger.info(f"Layer {i} Initial Spectral Norms: {init_sn}")
-            if use_wandb:
-                wandb.log({f"spectral_norm_init/layer_{i}/{k}": v for k, v in init_sn.items()})
-                if init_sn:
-                    wandb.log({f"spectral_norm_init/layer_{i}_max": max(init_sn.values())})
-        # ----------------------------------------
 
         with torch.no_grad():
             qlayer.to(args.dtype)
@@ -310,19 +286,7 @@ def affinequant(
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
                 
                 if use_wandb:
-                    # Collect loss data for this layer
-                    if i not in layer_loss_data:
-                        layer_loss_data[i] = []
-                    layer_loss_data[i].append((epochs, loss_mean.item()))
-                    
-                    # Log individual layer loss with global step for real-time monitoring
-                    global_step += 1
-                    wandb.log({
-                        f"loss/layer_{i}": loss_mean.item(),
-                        "layer": i,
-                        "epoch": epochs,
-                        "global_step": global_step
-                    })
+                    wandb.log({f"loss/layer_{i}": loss_mean.item(), "epoch": epochs})
             
             # 打印当前层的参数量
             layer_params = sum(p.numel() for p in qlayer.parameters())
@@ -334,74 +298,12 @@ def affinequant(
             logger.info(f"Layer {i} params: total={layer_params:,}, trainable={layer_trainable_params:,}, scale={scale_params:,}, shift={shift_params:,}")
 
             if use_wandb:
-                # Collect parameter data for final plot
-                all_layers_param_data.append((i, scale_params, shift_params, layer_trainable_params))
-                
-                # Also log immediately for real-time view
                 wandb.log({
-                    f"params/layer_{i}_scale": scale_params,
-                    f"params/layer_{i}_shift": shift_params,
-                    f"params/layer_{i}_trainable": layer_trainable_params,
-                    "layer": i
+                    "param_counts/scale": scale_params,
+                    "param_counts/shift": shift_params,
+                    "param_counts/total_trainable": layer_trainable_params,
+                    "layer_index": i
                 })
-                
-                # Update loss curves plot in real-time after each layer completes
-                try:
-                    import matplotlib.pyplot as plt
-                    import matplotlib.cm as cm
-                    import numpy as np
-                    
-                    fig, ax = plt.subplots(figsize=(18, 6))
-                    
-                    # Use a colormap to assign different colors to each layer
-                    num_completed_layers = len(layer_loss_data)
-                    colors = cm.tab20(np.linspace(0, 1, num_completed_layers)) if num_completed_layers <= 20 else cm.viridis(np.linspace(0, 1, num_completed_layers))
-                    
-                    # Track global step counter
-                    current_global_step = 0
-                    layer_boundaries = []
-                    
-                    for idx, (layer_id, loss_list) in enumerate(sorted(layer_loss_data.items())):
-                        # Assign global steps for this layer
-                        global_steps = []
-                        losses = []
-                        
-                        for epoch, loss in loss_list:
-                            global_steps.append(current_global_step)
-                            losses.append(loss)
-                            current_global_step += 1
-                        
-                        # Plot this layer's curve (points within same layer are connected)
-                        ax.plot(global_steps, losses, marker='o', markersize=4, linewidth=1.5, 
-                               color=colors[idx], label=f'Layer {layer_id}', alpha=0.8)
-                        
-                        # Record layer boundary for visualization
-                        if global_steps:
-                            layer_boundaries.append((global_steps[0], layer_id))
-                    
-                    # Add vertical lines at layer boundaries (except the first one)
-                    for idx in range(1, len(layer_boundaries)):
-                        boundary_x, layer_id = layer_boundaries[idx]
-                        ax.axvline(x=boundary_x - 0.5, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-                    
-                    ax.set_xlabel('Global Step', fontsize=12)
-                    ax.set_ylabel('Loss', fontsize=12)
-                    ax.set_title(f'Loss Curves by Layer (逐层量化Loss变化) - {num_completed_layers} layers completed', fontsize=14)
-                    ax.grid(True, alpha=0.3)
-                    
-                    # Create legend
-                    if num_completed_layers > 10:
-                        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, ncol=max(1, num_completed_layers // 15))
-                        plt.tight_layout(rect=[0, 0, 0.88, 1])
-                    else:
-                        ax.legend(loc='best', fontsize=9)
-                        plt.tight_layout()
-                    
-                    # Log the matplotlib figure to wandb (will update in real-time)
-                    wandb.log({"Loss_Curves_All_Layers": wandb.Image(fig)})
-                    plt.close(fig)
-                except Exception as e:
-                    logger.error(f"Failed to update real-time loss curves plot: {e}")
 
             qlayer.clear_temp_variable()
             del optimizer
@@ -445,29 +347,6 @@ def affinequant(
 
         # real smooth and quantization
         qlayer.smooth_and_quant_inplace(lm.model.config.num_attention_heads, maskqkv, maskfc,use_matrix=use_matrix,use_ln_matrix=use_ln_matrix)
-
-        # --- Calculate Final Spectral Norms ---
-        final_sn = {}
-        with torch.no_grad():
-            for n, m in qlayer.named_modules():
-                if isinstance(m, QuantLinear):
-                    try:
-                        sn = torch.linalg.norm(m.weight.float(), ord=2).item()
-                        final_sn[n] = sn
-                    except Exception as e:
-                        logger.warning(f"Failed to calc final spectral norm for {n}: {e}")
-            logger.info(f"Layer {i} Final Spectral Norms: {final_sn}")
-            if use_wandb:
-                wandb.log({f"spectral_norm_final/layer_{i}/{k}": v for k, v in final_sn.items()})
-                if final_sn:
-                    wandb.log({f"spectral_norm_final/layer_{i}_max": max(final_sn.values())})
-                
-                # Log the ratio (Growth/Change)
-                for k, v in final_sn.items():
-                    if k in init_sn and init_sn[k] > 0:
-                        wandb.log({f"spectral_norm_ratio/layer_{i}/{k}": v / init_sn[k]})
-        # --------------------------------------
-
         if args.epochs>0:
             # update input of quantization model
             with torch.no_grad():
@@ -517,141 +396,5 @@ def affinequant(
     torch.cuda.empty_cache()
     gc.collect()                    
     model.config.use_cache = use_cache
-
-    if use_wandb and layer_loss_data:
-        try:
-            import matplotlib.pyplot as plt
-            import matplotlib.cm as cm
-            import numpy as np
-            
-            # Create a simple plot: x=global_step, y=loss
-            # Each layer is a separate line segment (not connected to other layers)
-            fig, ax = plt.subplots(figsize=(18, 6))
-            
-            # Use a colormap to assign different colors to each layer
-            num_layers = len(layer_loss_data)
-            colors = cm.tab20(np.linspace(0, 1, num_layers)) if num_layers <= 20 else cm.viridis(np.linspace(0, 1, num_layers))
-            
-            # Track global step counter
-            current_global_step = 0
-            layer_boundaries = []
-            
-            for idx, (layer_id, loss_list) in enumerate(sorted(layer_loss_data.items())):
-                # Assign global steps for this layer
-                global_steps = []
-                losses = []
-                
-                for epoch, loss in loss_list:
-                    global_steps.append(current_global_step)
-                    losses.append(loss)
-                    current_global_step += 1
-                
-                # Plot this layer's curve (points within same layer are connected)
-                ax.plot(global_steps, losses, marker='o', markersize=4, linewidth=1.5, 
-                       color=colors[idx], label=f'Layer {layer_id}', alpha=0.8)
-                
-                # Record layer boundary for visualization
-                if global_steps:
-                    layer_boundaries.append((global_steps[0], layer_id))
-            
-            # Add vertical lines at layer boundaries (except the first one)
-            for i in range(1, len(layer_boundaries)):
-                boundary_x, layer_id = layer_boundaries[i]
-                ax.axvline(x=boundary_x - 0.5, color='gray', linestyle='--', linewidth=0.8, alpha=0.5)
-            
-            ax.set_xlabel('Global Step', fontsize=12)
-            ax.set_ylabel('Loss', fontsize=12)
-            ax.set_title('Loss Curves by Layer (逐层量化Loss变化)', fontsize=14)
-            ax.grid(True, alpha=0.3)
-            
-            # Create legend
-            if num_layers > 10:
-                ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left', fontsize=8, ncol=max(1, num_layers // 15))
-                plt.tight_layout(rect=[0, 0, 0.88, 1])
-            else:
-                ax.legend(loc='best', fontsize=9)
-                plt.tight_layout()
-            
-            # Log the matplotlib figure to wandb
-            wandb.log({"Loss_Curves_All_Layers": wandb.Image(fig)})
-            plt.close(fig)
-            
-            # Also create a line series chart for interactive viewing (original overlapped view)
-            wandb.log({
-                "Loss_Curves_by_Layer_Interactive": wandb.plot.line_series(
-                    xs=[list(range(len(loss_list))) for loss_list in layer_loss_data.values()],
-                    ys=[[loss for _, loss in loss_list] for loss_list in layer_loss_data.values()],
-                    keys=[f"Layer_{layer_id}" for layer_id in layer_loss_data.keys()],
-                    title="Loss Curves by Layer (Interactive - Overlapped)",
-                    xname="Epoch"
-                )
-            })
-            logger.info("Logged Loss Curves plots to WandB.")
-        except Exception as e:
-            logger.error(f"Failed to log Loss Curves plot to WandB: {e}")
-
-    if use_wandb and all_layers_param_data:
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            
-            # Create parameter counts plot with three lines: scale, shift, total_trainable
-            layer_indices = [item[0] for item in all_layers_param_data]
-            scale_params_list = [item[1] for item in all_layers_param_data]
-            shift_params_list = [item[2] for item in all_layers_param_data]
-            trainable_params_list = [item[3] for item in all_layers_param_data]
-            
-            # Create matplotlib figure for parameter counts
-            fig, ax = plt.subplots(figsize=(12, 6))
-            
-            x = np.array(layer_indices)
-            width = 0.25
-            
-            bars1 = ax.bar(x - width, scale_params_list, width, label='Scale参数量', color='#2ecc71', alpha=0.8)
-            bars2 = ax.bar(x, shift_params_list, width, label='Shift参数量', color='#3498db', alpha=0.8)
-            bars3 = ax.bar(x + width, trainable_params_list, width, label='总可训练参数量', color='#e74c3c', alpha=0.8)
-            
-            ax.set_xlabel('Layer Index', fontsize=12)
-            ax.set_ylabel('Parameter Count', fontsize=12)
-            ax.set_title('Parameter Counts by Layer (各层参数量统计)', fontsize=14)
-            ax.set_xticks(x)
-            ax.legend(loc='upper right', fontsize=10)
-            ax.grid(True, axis='y', alpha=0.3)
-            plt.tight_layout()
-            
-            # Log the matplotlib figure to wandb
-            wandb.log({"Param_Counts_All_Layers": wandb.Image(fig)})
-            plt.close(fig)
-            
-            # Also create a line chart for interactive viewing
-            fig2, ax2 = plt.subplots(figsize=(12, 6))
-            ax2.plot(layer_indices, scale_params_list, marker='o', linewidth=2, label='Scale参数量', color='#2ecc71')
-            ax2.plot(layer_indices, shift_params_list, marker='s', linewidth=2, label='Shift参数量', color='#3498db')
-            ax2.plot(layer_indices, trainable_params_list, marker='^', linewidth=2, label='总可训练参数量', color='#e74c3c')
-            
-            ax2.set_xlabel('Layer Index', fontsize=12)
-            ax2.set_ylabel('Parameter Count', fontsize=12)
-            ax2.set_title('Parameter Counts by Layer (Line Chart)', fontsize=14)
-            ax2.legend(loc='upper right', fontsize=10)
-            ax2.grid(True, alpha=0.3)
-            plt.tight_layout()
-            
-            wandb.log({"Param_Counts_Line_Chart": wandb.Image(fig2)})
-            plt.close(fig2)
-            
-            # Log line series chart for interactive viewing in wandb
-            wandb.log({
-                "Param_Counts_by_Layer_Interactive": wandb.plot.line_series(
-                    xs=[layer_indices, layer_indices, layer_indices],
-                    ys=[scale_params_list, shift_params_list, trainable_params_list],
-                    keys=["Scale参数量", "Shift参数量", "总可训练参数量"],
-                    title="Parameter Counts by Layer (Interactive)",
-                    xname="Layer Index"
-                )
-            })
-            logger.info("Logged Parameter Counts plots to WandB.")
-        except Exception as e:
-            logger.error(f"Failed to log Parameter Counts plot to WandB: {e}")
-
     return model.half()
 
