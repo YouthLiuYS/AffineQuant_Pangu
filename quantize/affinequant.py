@@ -12,7 +12,6 @@ import utils
 import os
 import pdb
 import gc
-import wandb # Import wandb
 
 
 
@@ -27,7 +26,6 @@ def affinequant(
     act_scales,
     act_shifts,
     logger=None,
-    use_wandb=False, # Add use_wandb parameter
 ):
     logger.info("Starting ...")
     
@@ -160,8 +158,6 @@ def affinequant(
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
         layer = layers[i].to(dev)
-        # Set current layer name for group_size configuration
-        args.current_layer_name = f"{layer_name_prefix}.{i}"
         qlayer = DecoderLayer(lm.model.config, layer, args)
 
         with torch.no_grad():
@@ -284,26 +280,6 @@ def affinequant(
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
-                
-                if use_wandb:
-                    wandb.log({f"loss/layer_{i}": loss_mean.item(), "epoch": epochs})
-            
-            # 打印当前层的参数量
-            layer_params = sum(p.numel() for p in qlayer.parameters())
-            layer_trainable_params = sum(p.numel() for p in qlayer.parameters() if p.requires_grad)
-            
-            # 统计当前层的 scale 和 shift 参数量
-            scale_params = sum(p.numel() for name, p in qlayer.named_parameters() if 'scale' in name.lower())
-            shift_params = sum(p.numel() for name, p in qlayer.named_parameters() if 'shift' in name.lower())
-            logger.info(f"Layer {i} params: total={layer_params:,}, trainable={layer_trainable_params:,}, scale={scale_params:,}, shift={shift_params:,}")
-
-            if use_wandb:
-                wandb.log({
-                    "param_counts/scale": scale_params,
-                    "param_counts/shift": shift_params,
-                    "param_counts/total_trainable": layer_trainable_params,
-                    "layer_index": i
-                })
 
             qlayer.clear_temp_variable()
             del optimizer

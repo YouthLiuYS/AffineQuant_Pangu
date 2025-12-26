@@ -27,7 +27,6 @@ from quantize.int_linear import QuantLinear
 
 import pdb
 import subprocess
-import wandb # Import wandb
 
 def get_gpu_memory_usage():
     command = "nvidia-smi --query-gpu=memory.used --format=csv,nounits,noheader"
@@ -201,11 +200,10 @@ def evaluate(lm, args, logger):
 
 
     if args.eval_ppl:
-        # for dataset in ["wikitext2", "ptb", "c4","ptb-new",'c4-new']:
-        for dataset in ["wikitext2", "ptb"]:
+        for dataset in ["wikitext2", "ptb", "c4","ptb-new",'c4-new']:
             cache_testloader = f'{args.cache_dir}/testloader_{args.model_family}_{dataset}_all.cache'
             if os.path.exists(cache_testloader):
-                testloader = torch.load(cache_testloader, weights_only=False)
+                testloader = torch.load(cache_testloader)
                 logger.info(f"load calibration from {cache_testloader}")
             else:
                 dataloader, testloader = get_loaders(
@@ -354,10 +352,6 @@ def main():
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
     parser.add_argument(
-        '--group_size_config_json', type=str, default=None,
-        help='JSON string for per-layer group size configuration. Example: \'{"model.decoder.layers.0": 64, "q_proj": 32}\''
-    )
-    parser.add_argument(
         '--benchmark', type=int, default=0,
         help='Number of tokens to use for benchmarking.'
     )
@@ -365,9 +359,6 @@ def main():
         '--check', action='store_true',
         help='Whether to compute perplexity during benchmarking for verification.'
     )
-    parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases for logging.")
-    parser.add_argument("--wandb_project", type=str, default="AffineQuant", help="Weights & Biases project name.")
-    parser.add_argument("--wandb_name", type=str, default=None, help="Weights & Biases run name.")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -393,10 +384,6 @@ def main():
     output_dir = Path(args.output_dir)
     logger = utils.create_logger(output_dir)
     logger.info(args)
-
-    if args.use_wandb:
-        wandb.init(project=args.wandb_project, name=args.wandb_name, config=args)
-        logger.info(f"Initialized wandb with project: {args.wandb_project}, run name: {args.wandb_name}")
     
     # load model
     if args.net is None:
@@ -410,21 +397,7 @@ def main():
     for param in lm.model.parameters():
         param.requires_grad = False
 
-    # Define group_size configuration
-    # Keys can be full module names or substrings/keywords
-    # Example:
-    # args.group_size_config = {
-    #     "model.decoder.layers.0": 64,  # Specific layer
-    #     "q_proj": 32,                  # All q_proj layers
-    # }
-    args.group_size_config = {}
-    if args.group_size_config_json:
-        import json
-        try:
-            args.group_size_config = json.loads(args.group_size_config_json)
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode group_size_config_json: {e}")
-            sys.exit(1)
+    
 
     args.weight_quant_params = {
         "n_bits": args.wbits,
@@ -432,8 +405,7 @@ def main():
         "symmetric": args.symmetric,
         "dynamic_method": args.w_dynamic_method,
         "group_size": args.group_size,
-        "lwc":args.lwc,
-        "group_size_config": args.group_size_config
+        "lwc":args.lwc
     }
     args.act_quant_params = {
         "n_bits":  args.abits,
@@ -482,7 +454,7 @@ def main():
         # load calibration dataset
         cache_dataloader = f'{args.cache_dir}/dataloader_{args.model_family}_{args.calib_dataset}_{args.nsamples}.cache'
         if os.path.exists(cache_dataloader):
-            dataloader = torch.load(cache_dataloader, weights_only=False)
+            dataloader = torch.load(cache_dataloader)
             logger.info(f"load calibration from {cache_dataloader}")
         else:
             dataloader, _ = get_loaders(
@@ -496,8 +468,8 @@ def main():
         act_scales = None
         act_shifts = None
         if args.let:
-            act_scales = torch.load(args.act_scales, weights_only=False)
-            act_shifts = torch.load(args.act_shifts, weights_only=False)
+            act_scales = torch.load(args.act_scales)
+            act_shifts = torch.load(args.act_shifts)
         affinequant(
             lm,
             args,
@@ -505,7 +477,6 @@ def main():
             act_scales,
             act_shifts,
             logger,
-            use_wandb=args.use_wandb, # Pass use_wandb flag
         )
         logger.info(time.time() - tick)
     if args.save_dir:
@@ -536,8 +507,6 @@ def main():
                 benchmark(lm.model, input_ids, check=args.check)
     
     evaluate(lm, args,logger)
-    if args.use_wandb:
-        wandb.finish()
 
 
 if __name__ == "__main__":

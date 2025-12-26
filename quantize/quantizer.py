@@ -31,8 +31,7 @@ class UniformAffineQuantizer(nn.Module):
         dynamic_method="per_cluster",
         group_size=None,
         shape=None,
-        lwc=False,
-        **kwargs
+        lwc=False
     ):
         """
         support cluster quantize

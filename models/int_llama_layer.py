@@ -13,7 +13,6 @@ from transformers.activations import ACT2FN
 import pdb
 import copy
 from models.transformation import *
-import utils
 
 
 
@@ -31,39 +30,14 @@ class QuantLlamaMLP(nn.Module):
         # self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         # self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         # self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        
-        current_layer_name = getattr(args, "current_layer_name", "")
-        group_size_config = args.weight_quant_params.get("group_size_config", {})
-        default_group_size = args.weight_quant_params.get("group_size")
-
-        gate_proj_params = copy.deepcopy(args.weight_quant_params)
-        gate_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.mlp.gate_proj", 
-            default_group_size
-        )
         self.gate_proj = QuantLinear(org_module.gate_proj,
-                                           gate_proj_params,
+                                           args.weight_quant_params,
                                            args.act_quant_params)
-        
-        down_proj_params = copy.deepcopy(args.weight_quant_params)
-        down_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.mlp.down_proj", 
-            default_group_size
-        )
         self.down_proj = QuantLinear(org_module.down_proj,
-                                           down_proj_params,
+                                           args.weight_quant_params,
                                            args.act_quant_params)
-        
-        up_proj_params = copy.deepcopy(args.weight_quant_params)
-        up_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.mlp.up_proj", 
-            default_group_size
-        )
         self.up_proj = QuantLinear(org_module.up_proj,
-                                           up_proj_params,
+                                           args.weight_quant_params,
                                            args.act_quant_params)
         self.act_fn = ACT2FN[hidden_act]
 
@@ -95,54 +69,23 @@ class QuantLlamaAttention(nn.Module):
 
         self.rotary_emb = copy.deepcopy(org_module.rotary_emb)
 
-        current_layer_name = getattr(args, "current_layer_name", "")
-        group_size_config = args.weight_quant_params.get("group_size_config", {})
-        default_group_size = args.weight_quant_params.get("group_size")
-
-        k_proj_params = copy.deepcopy(args.weight_quant_params)
-        k_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.self_attn.k_proj", 
-            default_group_size
-        )
         self.k_proj = QuantLinear(
             org_module.k_proj,
-            k_proj_params,
+            args.weight_quant_params,
             args.act_quant_params,
-        )
-
-        v_proj_params = copy.deepcopy(args.weight_quant_params)
-        v_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.self_attn.v_proj", 
-            default_group_size
         )
         self.v_proj = QuantLinear(
             org_module.v_proj,
-            v_proj_params,
+            args.weight_quant_params,
             args.act_quant_params,
-        )
-
-        q_proj_params = copy.deepcopy(args.weight_quant_params)
-        q_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.self_attn.q_proj", 
-            default_group_size
         )
         self.q_proj = QuantLinear(
             org_module.q_proj,
-            q_proj_params,
+            args.weight_quant_params,
             args.act_quant_params,
         )
-
-        o_proj_params = copy.deepcopy(args.weight_quant_params)
-        o_proj_params["group_size"] = utils.get_group_size(
-            group_size_config, 
-            f"{current_layer_name}.self_attn.o_proj", 
-            default_group_size
-        )
         self.o_proj = QuantLinear(
-            org_module.o_proj, o_proj_params, args.act_quant_params
+            org_module.o_proj, args.weight_quant_params, args.act_quant_params
         )
         self.qkt_matmul = QuantMatMul(
             args.q_quant_params, args.k_quant_params, matmul_func=torch.matmul
