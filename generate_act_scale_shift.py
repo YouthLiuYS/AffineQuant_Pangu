@@ -13,10 +13,10 @@ from datasets import load_dataset
 import functools
 from tqdm import tqdm
 from datautils import get_loaders
-try:
-    from llava.model import *   # required for llava
-except ImportError:
-    print("If want to quantize llave models, you should manually install llava from https://github.com/haotian-liu/LLaVA")
+# try:
+#     from llava.model import *   # required for llava
+# except ImportError:
+#     print("If want to quantize llave models, you should manually install llava from https://github.com/haotian-liu/LLaVA")
 
 # import pdb
 
