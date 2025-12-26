@@ -94,6 +94,115 @@ def get_act_shifts(model, dataloader, num_samples=128):
     return act_shifts
 
 
+def get_adaround_params(model, adaround_mode="full", init_bias=-5.0):
+    adaround = {}
+    try:
+        from quantize.int_linear import QuantLinear
+    except Exception:
+        QuantLinear = None
+
+    has_quant_linear = False
+    if QuantLinear is not None:
+        for m in model.modules():
+            if isinstance(m, QuantLinear):
+                has_quant_linear = True
+                break
+
+    mode = (adaround_mode or "full").lower()
+    for name, m in model.named_modules():
+        if has_quant_linear:
+            if QuantLinear is None or not isinstance(m, QuantLinear):
+                continue
+        else:
+            if not isinstance(m, nn.Linear):
+                continue
+
+        if mode in ("full", "full_matrix"):
+            v_shape = m.weight.shape
+        elif mode in ("per_channel", "channel", "out_channel"):
+            v_shape = (m.weight.shape[0], 1)
+        else:
+            raise ValueError(f"Unsupported adaround_mode: {adaround_mode}")
+
+        adaround[name] = torch.full(
+            v_shape,
+            float(init_bias),
+            dtype=m.weight.dtype,
+            device="cpu",
+        )
+
+    return adaround
+
+
+def get_adaround(
+    model,
+    adaround_mode="full",
+    init_bias=-5.0,
+    zeta=1.1,
+    gamma=-0.1,
+):
+    adaround_params = []
+    try:
+        from quantize.int_linear import QuantLinear
+    except Exception:
+        QuantLinear = None
+
+    has_quant_linear = False
+    if QuantLinear is not None:
+        for m in model.modules():
+            if isinstance(m, QuantLinear):
+                has_quant_linear = True
+                break
+
+    mode = (adaround_mode or "full").lower()
+    for _, m in model.named_modules():
+        if has_quant_linear:
+            if QuantLinear is None or not isinstance(m, QuantLinear):
+                continue
+        else:
+            if not isinstance(m, nn.Linear):
+                continue
+        if hasattr(m, "adaround_enabled"):
+            continue
+
+        weight = m.weight
+        if mode in ("full", "full_matrix"):
+            v_shape = weight.shape
+        elif mode in ("per_channel", "channel", "out_channel"):
+            v_shape = (weight.shape[0], 1)
+        else:
+            raise ValueError(f"Unsupported adaround_mode: {adaround_mode}")
+
+        v_param = nn.Parameter(
+            torch.full(
+                v_shape,
+                float(init_bias),
+                dtype=weight.dtype,
+                device=weight.device,
+            )
+        )
+        m.register_parameter("adaround_v", v_param)
+        m.register_buffer(
+            "adaround_zeta",
+            torch.tensor(float(zeta), dtype=weight.dtype, device=weight.device),
+        )
+        m.register_buffer(
+            "adaround_gamma",
+            torch.tensor(float(gamma), dtype=weight.dtype, device=weight.device),
+        )
+        m.register_buffer(
+            "adaround_init_bias",
+            torch.tensor(float(init_bias), dtype=weight.dtype, device=weight.device),
+        )
+        m.register_buffer(
+            "adaround_enabled",
+            torch.tensor(True, dtype=torch.bool, device=weight.device),
+        )
+        adaround_params.append(v_param)
+
+    return adaround_params
+
+
 
 
 def build_model_and_tokenizer(model_name):
@@ -110,11 +219,16 @@ def parse_args():
                         help='where to save the act scales')
     parser.add_argument('--shifts-output-path', type=str, default='./act_shifts/',
                         help='where to save the act shifts')
+    parser.add_argument('--adaround-output-path', type=str, default='./adaround_params/',
+                        help='where to save the adaround params')
     parser.add_argument("--calib_dataset",type=str,default="wikitext2",
         choices=["wikitext2", "ptb", "c4", "mix","pile"],
         help="Where to extract calibration data from.",)
     parser.add_argument('--num-samples', type=int, default=128)
     parser.add_argument('--seq-len', type=int, default=2048)
+    parser.add_argument('--adaround-mode', type=str, default="full",
+                        choices=["full", "full_matrix", "per_channel", "channel", "out_channel"])
+    parser.add_argument('--adaround-init-bias', type=float, default=-5.0)
     parser.add_argument("--seed", type=int, default=2, help="Seed for sampling the calibration data.")
     args = parser.parse_args()
     return args
@@ -142,6 +256,15 @@ def main():
     save_path = os.path.join(args.shifts_output_path,f'{args.net}.pt')
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(act_shifts, save_path)
+
+    adaround_params = get_adaround_params(
+        model,
+        adaround_mode=args.adaround_mode,
+        init_bias=args.adaround_init_bias,
+    )
+    save_path = os.path.join(args.adaround_output_path, f'{args.net}.pt')
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    torch.save(adaround_params, save_path)
 
 
 if __name__ == '__main__':

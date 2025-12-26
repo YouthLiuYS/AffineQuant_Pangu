@@ -331,7 +331,7 @@ class QuantFalconDecoderLayer(nn.Module):
             raise ValueError("falcon not yet support let")
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
-                module.weight = module.weight_quantizer(module.weight)
+                module.weight = module.quantize_weight(module.weight)
                 module.use_temporary_parameter=False
                 
 
@@ -352,9 +352,9 @@ class QuantFalconDecoderLayer(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 if hasattr(module, "temp_weight"):
-                    module.temp_weight = module.weight_quantizer(module.temp_weight)
+                    module.temp_weight = module.quantize_weight(module.temp_weight)
                 else:
-                    module.temp_weight = module.weight_quantizer(module.weight)
+                    module.temp_weight = module.quantize_weight(module.weight)
                 if not hasattr(module, "temp_bias"):
                     module.temp_bias = module.bias
                 module.use_temporary_parameter=True
@@ -375,11 +375,18 @@ class QuantFalconDecoderLayer(nn.Module):
                 params.append(m)
         return iter(params)  
 
+    def adaround_parameters(self):
+        params = []
+        for n, m in self.named_parameters():
+            if n.find('adaround_v') > -1:
+                params.append(m)
+        return iter(params)
+
     def affine_parameters(self, use_shift=True):
         params = []
         template = "smooth" if use_shift else "smooth_scale"
         for n, m in self.named_parameters():
-            if n.find('bound_factor') > -1 or n.find(template) > -1:
+            if n.find('bound_factor') > -1 or n.find(template) > -1 or n.find('adaround_v') > -1:
                 params.append(m)
         return iter(params)  
     
@@ -387,7 +394,7 @@ class QuantFalconDecoderLayer(nn.Module):
         if destination is None:
             destination = OrderedDict()
         for name, param in self.named_parameters():
-            if name.find('smooth') > -1 or name.find('bound_factor') > -1:
+            if name.find('smooth') > -1 or name.find('bound_factor') > -1 or name.find('adaround_v') > -1:
                 destination[prefix + name] = param if keep_vars else param.detach()
         return destination
     

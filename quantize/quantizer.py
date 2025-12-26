@@ -103,6 +103,37 @@ class UniformAffineQuantizer(nn.Module):
         if self.deficiency > 0:
             x_dequant = x_dequant[:,:-self.deficiency]
         return x_dequant
+
+    def _adaround_h(self, v, zeta=1.1, gamma=-0.1):
+        h = torch.sigmoid(v) * (zeta - gamma) + gamma
+        return h.clamp(0, 1)
+
+    def fake_quant_adaround(self, x, scale, round_zero_point, v, zeta=1.1, gamma=-0.1):
+        if v.shape != x.shape:
+            v = v.expand_as(x)
+        if self.deficiency > 0:
+            pad_zeros = torch.zeros((x.shape[0],self.deficiency),dtype=x.dtype,device=x.device)
+            x = torch.cat((x,pad_zeros),dim=1)
+            v = torch.cat((v, torch.zeros_like(pad_zeros)), dim=1)
+
+        if self.group_size:
+            assert len(x.shape)==2, "only support linear layer now"
+            dim1, dim2 = x.shape
+            x = x.reshape(-1, self.group_size)
+            v = v.reshape(-1, self.group_size)
+        x_int = torch.floor(x / scale) + self._adaround_h(v, zeta, gamma)
+        if round_zero_point is not None:
+            x_int = x_int.add(round_zero_point)
+        x_int = x_int.clamp(self.qmin, self.qmax)
+        x_dequant = x_int
+        if round_zero_point is not None:
+            x_dequant = x_dequant.sub(round_zero_point)
+        x_dequant = x_dequant.mul(scale)
+        if self.group_size:
+            x_dequant = x_dequant.reshape(dim1, dim2)
+        if self.deficiency > 0:
+            x_dequant = x_dequant[:,:-self.deficiency]
+        return x_dequant
     
 
     def forward(self, x: torch.Tensor):
@@ -117,6 +148,20 @@ class UniformAffineQuantizer(nn.Module):
             raise NotImplementedError()   
 
         x_dequant = self.fake_quant(x, self.scale, self.round_zero_point)
+        return x_dequant
+
+    def adaround_quant(self, x: torch.Tensor, v: torch.Tensor, zeta=1.1, gamma=-0.1):
+        if self.n_bits >= 16 or not self.enable:
+            return x
+        if self.metric == "fix0to1":
+            return x.mul_(2**self.n_bits-1).round_().div_(2**self.n_bits-1)
+
+        if self.dynamic_method == "per_token" or self.dynamic_method == "per_channel":
+            self.per_token_dynamic_calibration(x)
+        else:
+            raise NotImplementedError()
+
+        x_dequant = self.fake_quant_adaround(x, self.scale, self.round_zero_point, v, zeta, gamma)
         return x_dequant
 
     def per_token_dynamic_calibration(self, x):
