@@ -13,48 +13,7 @@ import os
 import pdb
 import gc
 import wandb # Import wandb
-import numpy as np
 
-
-def analyze_and_log_weight_distribution(layer_index, all_layer_diffs, logger, use_wandb=False):
-    """
-    Analyzes the distribution of weight quantization errors and logs stats to WandB.
-    Returns:
-        kurtosis_val (float): Excess Kurtosis of the error distribution.
-        skewness_val (float): Skewness of the error distribution.
-    """
-    kurtosis_val = 0.0
-    skewness_val = 0.0
-    
-    if all_layer_diffs:
-        # Combine all diffs into a single numpy array
-        combined_diffs = torch.cat(all_layer_diffs).float().cpu().numpy()
-        
-        # Calculate Stats via Numpy
-        mean_val = np.mean(combined_diffs)
-        std_val = np.std(combined_diffs)
-        
-        if std_val > 1e-9:
-            # Skewness: E[(x-mu)^3] / sigma^3
-            skewness_val = np.mean(((combined_diffs - mean_val) / std_val) ** 3)
-            # Kurtosis (Excess): E[(x-mu)^4] / sigma^4 - 3
-            # Normal ~ 0.0, Uniform ~ -1.2
-            kurtosis_val = np.mean(((combined_diffs - mean_val) / std_val) ** 4) - 3.0
-        
-        if logger:
-            logger.info(f"Layer {layer_index} Error Dist: Skewness={skewness_val:.4f}, Kurtosis={kurtosis_val:.4f}")
-        
-        if use_wandb:
-            wandb.log({
-                f"weight_error_dist/layer_{layer_index}": wandb.Histogram(combined_diffs),
-                f"weight_error_stats/kurtosis": kurtosis_val,
-                f"weight_error_stats/skewness": skewness_val,
-                "layer": layer_index
-            })
-        
-        del combined_diffs
-
-    return kurtosis_val, skewness_val
 
 
 def get_named_linears(module):
@@ -203,14 +162,6 @@ def affinequant(
     layer_loss_data = {}
     # List to collect parameter data for bar chart: [(layer_index, scale_params, shift_params, total_trainable_params), ...]
     all_layers_param_data = []
-    # Lists to collect final error metrics per layer
-    layer_final_loss_data = []      # [(layer_index, final_output_mse), ...]
-    layer_weight_mse_data = []      # [(layer_index, avg_weight_mse), ...]
-    layer_weight_l1_data = []       # [(layer_index, avg_weight_l1), ...]
-    layer_weight_max_data = []      # [(layer_index, max_weight_diff), ...]
-    layer_weight_mean_data = []     # [(layer_index, mean_weight_diff), ...]
-    layer_weight_kurtosis_data = [] # [(layer_index, kurtosis), ...]
-    layer_weight_skewness_data = [] # [(layer_index, skewness), ...]
     
     for i in range(len(layers)):
         logger.info(f"=== Start quantize layer {i} ===")
@@ -286,7 +237,6 @@ def affinequant(
         if args.resume and i < len(affine_parameters):
             qlayer.load_state_dict(affine_parameters[i], strict=False)
         
-        final_output_loss = 0.0
         if args.epochs > 0 and not (args.resume and i < len(affine_parameters)):
             with torch.no_grad():
                 qlayer.to(args.dtype)      # required for AMP training
@@ -356,7 +306,6 @@ def affinequant(
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
-                final_output_loss = loss_mean.item() # Update final loss
                 norm_mean = torch.stack(norm_list).mean()
                 logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
                 
@@ -497,16 +446,8 @@ def affinequant(
         # real smooth and quantization
         qlayer.smooth_and_quant_inplace(lm.model.config.num_attention_heads, maskqkv, maskfc,use_matrix=use_matrix,use_ln_matrix=use_ln_matrix)
 
-        # --- Calculate Final Spectral Norms & Weight Errors ---
+        # --- Calculate Final Spectral Norms ---
         final_sn = {}
-        total_weight_mse = 0.0
-        total_weight_l1 = 0.0
-        total_weight_max_err = 0.0
-        total_weight_mean_err = 0.0 # This usually is close to 0 if symmetric/unbiased
-        num_linear_modules = 0
-        
-        all_layer_diffs = [] # Collect all weight diffs for histogram
-
         with torch.no_grad():
             for n, m in qlayer.named_modules():
                 if isinstance(m, QuantLinear):
@@ -515,40 +456,7 @@ def affinequant(
                         final_sn[n] = sn
                     except Exception as e:
                         logger.warning(f"Failed to calc final spectral norm for {n}: {e}")
-                    
-                    try:
-                        if m.weight_quantizer.enable:
-                             w = m.weight
-                             w_q = m.weight_quantizer(w) # Fake quant
-                             
-                             # Calculate various errors
-                             diff = w - w_q
-                             
-                             # Collect for histogram (keep on CPU to save GPU memory)
-                             # Only sample if too large? 16M is fine for CPU RAM usually.
-                             all_layer_diffs.append(diff.detach().cpu().flatten())
-
-                             mse = torch.mean(diff ** 2).item()
-                             l1 = torch.mean(torch.abs(diff)).item()
-                             max_err = torch.max(torch.abs(diff)).item()
-                             mean_err = torch.mean(diff).item()
-                             
-                             total_weight_mse += mse
-                             total_weight_l1 += l1
-                             total_weight_max_err += max_err
-                             total_weight_mean_err += mean_err
-                             num_linear_modules += 1
-                    except Exception as e:
-                        logger.warning(f"Failed to calc weight error for {n}: {e}")
-            
-            avg_weight_mse = total_weight_mse / num_linear_modules if num_linear_modules > 0 else 0.0
-            avg_weight_l1 = total_weight_l1 / num_linear_modules if num_linear_modules > 0 else 0.0
-            avg_weight_max = total_weight_max_err / num_linear_modules if num_linear_modules > 0 else 0.0
-            avg_weight_mean = total_weight_mean_err / num_linear_modules if num_linear_modules > 0 else 0.0
-            
             logger.info(f"Layer {i} Final Spectral Norms: {final_sn}")
-            logger.info(f"Layer {i} Weight Errors: MSE={avg_weight_mse:.6f}, L1={avg_weight_l1:.6f}, Max={avg_weight_max:.6f}")
-            
             if use_wandb:
                 wandb.log({f"spectral_norm_final/layer_{i}/{k}": v for k, v in final_sn.items()})
                 if final_sn:
@@ -558,28 +466,6 @@ def affinequant(
                 for k, v in final_sn.items():
                     if k in init_sn and init_sn[k] > 0:
                         wandb.log({f"spectral_norm_ratio/layer_{i}/{k}": v / init_sn[k]})
-                
-                # Log weight error distribution histogram and stats
-                kurtosis_val, skewness_val = analyze_and_log_weight_distribution(i, all_layer_diffs, logger, use_wandb)
-                if all_layer_diffs:
-                    del all_layer_diffs
-
-                # Log final errors for this layer
-                layer_final_loss_data.append((i, final_output_loss))
-                layer_weight_mse_data.append((i, avg_weight_mse))
-                layer_weight_l1_data.append((i, avg_weight_l1))
-                layer_weight_max_data.append((i, avg_weight_max))
-                layer_weight_mean_data.append((i, avg_weight_mean))
-                layer_weight_kurtosis_data.append((i, kurtosis_val))
-                layer_weight_skewness_data.append((i, skewness_val))
-                
-                wandb.log({
-                    "final_layer_loss": final_output_loss,
-                    "final_layer_weight_mse": avg_weight_mse,
-                    "final_layer_weight_l1": avg_weight_l1,
-                    "final_layer_weight_max": avg_weight_max,
-                    "layer": i
-                })
         # --------------------------------------
 
         if args.epochs>0:
@@ -703,150 +589,6 @@ def affinequant(
             logger.info("Logged Loss Curves plots to WandB.")
         except Exception as e:
             logger.error(f"Failed to log Loss Curves plot to WandB: {e}")
-
-    # Plot Final Layerwise Output Loss
-    if use_wandb and layer_final_loss_data:
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            
-            layers_x = [x[0] for x in layer_final_loss_data]
-            losses_y = [x[1] for x in layer_final_loss_data]
-            
-            fig, ax = plt.subplots(figsize=(12, 6))
-            ax.bar(layers_x, losses_y, color='#e74c3c', alpha=0.7)
-            ax.set_xlabel('Layer Index', fontsize=12)
-            ax.set_ylabel('MSE Loss', fontsize=12)
-            ax.set_title('Final Output MSE Loss per Layer (各层最终输出误差)', fontsize=14)
-            ax.grid(True, axis='y', alpha=0.3)
-            plt.tight_layout()
-            wandb.log({"Final_Layer_Output_Loss_Bar": wandb.Image(fig)})
-            plt.close(fig)
-            
-            wandb.log({
-                "Final_Layer_Output_Loss_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_final_loss_data, columns=["layer", "loss"]),
-                    x="layer",
-                    y="loss",
-                    title="Final Output MSE Loss per Layer"
-                )
-            })
-        except Exception as e:
-            logger.error(f"Failed to log Final Layer Output Loss: {e}")
-
-    # Plot Final Layerwise Weight Quantization Errors (Combined)
-    if use_wandb and layer_weight_mse_data:
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            
-            layers_x = [x[0] for x in layer_weight_mse_data]
-            mse_y = [x[1] for x in layer_weight_mse_data]
-            l1_y = [x[1] for x in layer_weight_l1_data]
-            max_y = [x[1] for x in layer_weight_max_data]
-            
-            # 1. MSE and L1 Bar Chart
-            fig, ax = plt.subplots(figsize=(14, 6))
-            x = np.arange(len(layers_x))
-            width = 0.35
-            
-            ax.bar(x - width/2, mse_y, width, label='MSE', color='#9b59b6', alpha=0.7)
-            ax.bar(x + width/2, l1_y, width, label='L1 (MAE)', color='#3498db', alpha=0.7)
-            
-            ax.set_xlabel('Layer Index', fontsize=12)
-            ax.set_ylabel('Error Value', fontsize=12)
-            ax.set_title('Weight Quantization Error per Layer (MSE vs L1)', fontsize=14)
-            ax.set_xticks(x)
-            ax.set_xticklabels(layers_x)
-            ax.legend()
-            ax.grid(True, axis='y', alpha=0.3)
-            plt.tight_layout()
-            wandb.log({"Layer_Weight_Error_MSE_L1_Bar": wandb.Image(fig)})
-            plt.close(fig)
-            
-            # 2. Max Error Bar Chart (Separate usually due to scale)
-            fig2, ax2 = plt.subplots(figsize=(12, 6))
-            ax2.bar(layers_x, max_y, color='#e67e22', alpha=0.7)
-            ax2.set_xlabel('Layer Index', fontsize=12)
-            ax2.set_ylabel('Max Abs Error', fontsize=12)
-            ax2.set_title('Max Weight Quantization Error per Layer', fontsize=14)
-            ax2.grid(True, axis='y', alpha=0.3)
-            plt.tight_layout()
-            wandb.log({"Layer_Weight_Error_Max_Bar": wandb.Image(fig2)})
-            plt.close(fig2)
-            
-            # 3. Interactive Line Plots
-            wandb.log({
-                "Layer_Weight_MSE_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_weight_mse_data, columns=["layer", "mse"]),
-                    x="layer",
-                    y="mse",
-                    title="Average Weight MSE per Layer"
-                ),
-                "Layer_Weight_L1_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_weight_l1_data, columns=["layer", "l1"]),
-                    x="layer",
-                    y="l1",
-                    title="Average Weight L1 (MAE) per Layer"
-                ),
-                 "Layer_Weight_Max_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_weight_max_data, columns=["layer", "max_err"]),
-                    x="layer",
-                    y="max_err",
-                    title="Max Weight Error per Layer"
-                )
-            })
-        except Exception as e:
-            logger.error(f"Failed to log Layer Weight Quant Error: {e}")
-
-    # Plot Kurtosis and Skewness
-    if use_wandb and layer_weight_kurtosis_data:
-        try:
-            import matplotlib.pyplot as plt
-            import numpy as np
-            
-            layers_x = [x[0] for x in layer_weight_kurtosis_data]
-            kurtosis_y = [x[1] for x in layer_weight_kurtosis_data]
-            skewness_y = [x[1] for x in layer_weight_skewness_data]
-            
-            fig, ax = plt.subplots(figsize=(14, 6))
-            x = np.arange(len(layers_x))
-            width = 0.35
-            
-            # Kurtosis
-            ax.bar(x - width/2, kurtosis_y, width, label='Kurtosis (Uniform ~ -1.2)', color='#e74c3c', alpha=0.7)
-            # Reference line for Uniform Distribution
-            ax.axhline(y=-1.2, color='gray', linestyle='--', linewidth=1, label='Ideal Uniform (-1.2)')
-            ax.axhline(y=0.0, color='black', linestyle='--', linewidth=1, label='Ideal Normal (0.0)')
-            
-            ax.set_xlabel('Layer Index', fontsize=12)
-            ax.set_ylabel('Kurtosis Value', fontsize=12)
-            ax.set_title('Weight Quantization Error Kurtosis per Layer', fontsize=14)
-            ax.set_xticks(x)
-            ax.set_xticklabels(layers_x)
-            ax.legend()
-            ax.grid(True, axis='y', alpha=0.3)
-            plt.tight_layout()
-            wandb.log({"Layer_Weight_Error_Kurtosis_Bar": wandb.Image(fig)})
-            plt.close(fig)
-            
-            # Interactive Line Plots for Stats
-            wandb.log({
-                "Layer_Weight_Kurtosis_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_weight_kurtosis_data, columns=["layer", "kurtosis"]),
-                    x="layer",
-                    y="kurtosis",
-                    title="Weight Error Kurtosis (Uniform ~ -1.2)"
-                ),
-                "Layer_Weight_Skewness_Interactive": wandb.plot.line(
-                    table=wandb.Table(data=layer_weight_skewness_data, columns=["layer", "skewness"]),
-                    x="layer",
-                    y="skewness",
-                    title="Weight Error Skewness (Ideal ~ 0)"
-                )
-            })
-        except Exception as e:
-            logger.error(f"Failed to log Layer Weight Stats: {e}")
 
     if use_wandb and all_layers_param_data:
         try:

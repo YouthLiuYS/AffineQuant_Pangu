@@ -24,9 +24,7 @@ dependencies = [
     "transformers==4.35.2", 
     "texttable",
     "toml", "attributedict",
-    "protobuf",
-    "wandb",
-    "matplotlib"
+    "protobuf"
 ]
 
 [tool.setuptools.packages.find]

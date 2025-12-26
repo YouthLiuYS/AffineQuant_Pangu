@@ -462,14 +462,7 @@ class QuantOPTDecoderLayer(nn.Module):
                                 self.qkt_smooth_scale,use_matrix=use_matrix)
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
-                # Calculate smoothed weight (current module.weight)
-                w_smooth = module.weight
-                # Quantize
-                w_q = module.weight_quantizer(w_smooth)
-                # Store diff (on CPU to save GPU memory)
-                module.weight_quant_error = (w_smooth - w_q).cpu()
-                # Update weight
-                module.weight = w_q
+                module.weight = module.weight_quantizer(module.weight)
                 module.use_temporary_parameter=False
                 
 
