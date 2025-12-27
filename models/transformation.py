@@ -46,16 +46,14 @@ def smooth_ln_fcs_temporary(ln, fcs, scales, mask, shifts, use_ln_matrix=False):
 
     for fc in fcs:
         fc.use_temporary_parameter = True
-        # 使用已有的 temp_weight（可能已经 adaround 量化过），如果没有则使用原始 weight
-        base_weight = fc.temp_weight if hasattr(fc, 'temp_weight') else fc.weight
         if hasattr(fc, 'bias') and fc.bias is not None:
             fc.temp_bias = fc.bias + fc.weight@shifts
         else:
             fc.temp_bias = fc.weight@shifts
         if use_ln_matrix:
-            fc.temp_weight = base_weight.matmul((scales.mul(mask)).t())
+            fc.temp_weight = fc.weight.matmul((scales.mul(mask)).t())
         else:
-            fc.temp_weight = base_weight * scales.view(1,-1)
+            fc.temp_weight = fc.weight * scales.view(1,-1)
 
 
 def smooth_fc_fc_temporary(fc1, fc2, scales, num_heads, mask, shifts=None):
@@ -73,13 +71,11 @@ def smooth_fc_fc_temporary(fc1, fc2, scales, num_heads, mask, shifts=None):
         fc1.temp_bias = fc1.bias.matmul((scales.mul(mask)).inverse())
         fc1.temp_weight = (scales.mul(mask)).inverse().t().matmul(fc1.weight)
     
-    # 使用已有的 temp_weight（可能已经 adaround 量化过），如果没有则使用原始 weight
-    fc2_base_weight = fc2.temp_weight if hasattr(fc2, 'temp_weight') else fc2.weight
     if hasattr(fc2, 'bias') and fc2.bias is not None:
         fc2.temp_bias = fc2.bias + fc2.weight@shifts
     else:
         fc2.temp_bias = fc2.weight@shifts
-    fc2.temp_weight = fc2_base_weight.matmul((scales.mul(mask)).t())
+    fc2.temp_weight = fc2.weight.matmul((scales.mul(mask)).t())
 
 
 def smooth_q_k_temporary(q_proj, k_proj, maskfc, scales, use_matrix= False):

@@ -355,9 +355,13 @@ def main():
     parser.add_argument("--adaround", action="store_true", help="enable adaround rounding")
     parser.add_argument("--adaround-params", type=str, default=None)
     parser.add_argument("--adaround-layer-idx", type=int, default=-1, help="only enable adaround for this layer index")
-    parser.add_argument("--adaround-reg-weight", type=float, default=1.0, help="weight for adaround binarization regularizer")
-    parser.add_argument("--adaround-beta-start", type=float, default=4.0, help="initial beta for adaround annealing")
+    parser.add_argument("--adaround-reg-weight", type=float, default=0.01, help="weight for adaround binarization regularizer")
+    parser.add_argument("--adaround-beta-start", type=float, default=20.0, help="initial beta for adaround annealing")
     parser.add_argument("--adaround-beta-end", type=float, default=2.0, help="final beta for adaround annealing")
+    parser.add_argument("--adaround-lr", type=float, default=1e-3, help="learning rate for adaround parameters")
+    parser.add_argument("--adaround-epochs", type=int, default=0, help="epochs for adaround training (after AffineQuant)")
+    parser.add_argument("--joint-epochs", type=int, default=0, help="epochs for joint fine-tune (smooth + adaround)")
+    parser.add_argument("--joint-lr-scale", type=float, default=0.1, help="learning rate scale for joint fine-tune")
     parser.add_argument(
         '--benchmark', type=int, default=0,
         help='Number of tokens to use for benchmarking.'
