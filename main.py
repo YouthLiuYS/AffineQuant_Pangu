@@ -354,10 +354,6 @@ def main():
     parser.add_argument("--act-shifts", type=str, default=None)
     parser.add_argument("--adaround", action="store_true", help="enable adaround rounding")
     parser.add_argument("--adaround-params", type=str, default=None)
-    parser.add_argument("--adaround-layer-idx", type=int, default=-1, help="only enable adaround for this layer index")
-    parser.add_argument("--adaround-reg-weight", type=float, default=1.0, help="weight for adaround binarization regularizer")
-    parser.add_argument("--adaround-beta-start", type=float, default=4.0, help="initial beta for adaround annealing")
-    parser.add_argument("--adaround-beta-end", type=float, default=2.0, help="final beta for adaround annealing")
     parser.add_argument(
         '--benchmark', type=int, default=0,
         help='Number of tokens to use for benchmarking.'
@@ -491,7 +487,6 @@ def main():
             act_scales,
             act_shifts,
             adaround,
-            args.adaround_layer_idx,
             logger,
         )
         logger.info(time.time() - tick)

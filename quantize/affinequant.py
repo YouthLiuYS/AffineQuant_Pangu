@@ -18,45 +18,6 @@ import gc
 def get_named_linears(module):
     return {name: m for name, m in module.named_modules() if isinstance(m, QuantLinear)}
 
-def _adaround_soft(v, zeta, gamma):
-    h = torch.sigmoid(v) * (zeta - gamma) + gamma
-    return h.clamp(0, 1)
-
-def _adaround_regularizer(module, beta):
-    loss = None
-    for _, m in module.named_modules():
-        if not hasattr(m, "adaround_v") or not hasattr(m, "adaround_enabled"):
-            continue
-        if not bool(m.adaround_enabled):
-            continue
-        zeta = getattr(m, "adaround_zeta", 1.1)
-        gamma = getattr(m, "adaround_gamma", -0.1)
-        h = _adaround_soft(m.adaround_v, zeta, gamma)
-        term = (1 - (2 * h - 1).abs().pow(beta)).sum()
-        if loss is None:
-            loss = term
-        else:
-            loss = loss + term
-    if loss is None:
-        return torch.tensor(0.0, device=next(module.parameters()).device)
-    return loss
-
-def _adaround_hard_round(module, pos_value=10.0):
-    for _, m in module.named_modules():
-        if not hasattr(m, "adaround_v") or not hasattr(m, "adaround_enabled"):
-            continue
-        if not bool(m.adaround_enabled):
-            continue
-        zeta = getattr(m, "adaround_zeta", 1.1)
-        gamma = getattr(m, "adaround_gamma", -0.1)
-        h = _adaround_soft(m.adaround_v, zeta, gamma)
-        hard = (h >= 0.5).to(dtype=m.adaround_v.dtype)
-        m.adaround_v.data = torch.where(
-            hard > 0,
-            torch.full_like(m.adaround_v, pos_value),
-            torch.full_like(m.adaround_v, -pos_value),
-        )
-
 
 def affinequant(
     lm,
@@ -65,7 +26,6 @@ def affinequant(
     act_scales,
     act_shifts,
     adaround_params=None,
-    adaround_layer_idx=-1,
     logger=None,
 ):
     logger.info("Starting ...")
@@ -247,7 +207,7 @@ def affinequant(
                                 qlayer.register_parameter(f"{pairs[key]}_smooth_shift",torch.nn.Parameter(shift.to(args.dtype)))
                                 qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(torch.diag(scale.to(args.dtype))))
 
-        if adaround_params and (adaround_layer_idx < 0 or adaround_layer_idx == i):
+        if adaround_params:
             for name, module in qlayer.named_modules():
                 if not isinstance(module, QuantLinear):
                     continue
@@ -300,13 +260,8 @@ def affinequant(
             if adaround_layer_params:
                 trainable_params.extend(adaround_layer_params)
             
-            steps_per_epoch = args.nsamples // args.batch_size
-            total_steps = max(steps_per_epoch * max(args.epochs, 1), 1)
-
             for epochs in range(args.epochs):
                 loss_list = []
-                recon_loss_list = []
-                com_loss_list = []
                 norm_list = []
 
                 # gradual mask
@@ -353,44 +308,21 @@ def affinequant(
                         qlayer.smooth_and_quant_temporary(lm.model.config.num_attention_heads, maskqkv, maskfc, use_matrix=use_matrix, use_ln_matrix=use_ln_matrix)
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
-                        recon_loss = loss
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-                        if adaround_layer_params and args.adaround_reg_weight > 0:
-                            if args.epochs > 1:
-                                progress = epochs / (args.epochs - 1)
-                            else:
-                                progress = 1.0
-                            beta = args.adaround_beta_start + (args.adaround_beta_end - args.adaround_beta_start) * progress
-                            loss_com = _adaround_regularizer(qlayer, beta)
-                            scale = recon_loss.detach() / (loss_com.detach() + 1e-12)
-                            loss_com = loss_com * scale
-                            loss = loss + args.adaround_reg_weight * loss_com
-                            com_loss = loss_com
-                        else:
-                            com_loss = torch.tensor(0.0, device=loss.device)
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
                         
                     loss_list.append(loss.data)
-                    recon_loss_list.append(recon_loss.data)
-                    com_loss_list.append(com_loss.data)
                     optimizer.zero_grad()
                     norm = loss_scaler(loss, optimizer, parameters=trainable_params)
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
-                recon_mean = torch.stack(recon_loss_list).mean()
-                com_mean = torch.stack(com_loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
-                logger.info(
-                    f"layer {i} iter {epochs} loss:{loss_mean} recon:{recon_mean} L_com:{com_mean} "
-                    f"norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} "
-                )
+                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
 
-            if adaround_layer_params:
-                _adaround_hard_round(qlayer)
             qlayer.clear_temp_variable()
             del optimizer
 
