@@ -280,11 +280,23 @@ class QuantLlamaDecoderLayer(nn.Module):
                 m.set_quant_state(weight_quant, act_quant)
       
     def smooth_and_quant_temporary(self, num_heads, maskqkv, maskfc, use_matrix=False, use_ln_matrix=False):
+        
         if self.let:
             with torch.no_grad():
                 for name, module in self.named_parameters():
                     if "smooth_scale" in name:
                         module.data = truncate_number(module)
+            
+            # 步骤 1: 先对所有层的原始权重进行 adaround 量化
+            # 这样 adaround_v 和原始权重保持对应关系
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    module.temp_weight = module.quantize_weight(module.weight)
+                    if not hasattr(module, "temp_bias"):
+                        module.temp_bias = module.bias
+            
+            # 步骤 2: 对量化后的权重应用 smooth transform
+            # smooth transform 函数现在会使用已有的 temp_weight 作为基础
             smooth_ln_fcs_temporary(self.input_layernorm,[self.self_attn.q_proj, self.self_attn.k_proj, self.self_attn.v_proj],
                                     self.qkv_smooth_scale, maskqkv,self.qkv_smooth_shift,use_ln_matrix=use_ln_matrix)
             smooth_ln_fcs_temporary(self.post_attention_layernorm,[self.mlp.up_proj,self.mlp.gate_proj],
@@ -293,21 +305,26 @@ class QuantLlamaDecoderLayer(nn.Module):
                                 self.out_smooth_scale, num_heads, maskfc,self.out_smooth_shift)
             smooth_q_k_temporary(self.self_attn.q_proj, self.self_attn.k_proj, maskfc,
                                 self.qkt_smooth_scale, use_matrix= use_matrix)
-            self.mlp.down_proj.temp_weight = self.mlp.down_proj.weight
+            # down_proj 不经过 smooth transform，但已经在上面量化过了
+            
+            # 设置所有模块使用临时参数
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    module.use_temporary_parameter = True
         else:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
                     module.temp_weight = module.weight
-        # quant: adaround 作用于 smooth 后的 temp_weight
-        for name, module in self.named_modules():
-            if isinstance(module, QuantLinear):
-                if hasattr(module, "temp_weight"):
-                    module.temp_weight = module.quantize_weight(module.temp_weight)
-                else:
-                    module.temp_weight = module.quantize_weight(module.weight)
-                if not hasattr(module, "temp_bias"):
-                    module.temp_bias = module.bias
-                module.use_temporary_parameter=True
+            # quant
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    if hasattr(module, "temp_weight"):
+                        module.temp_weight = module.quantize_weight(module.temp_weight)
+                    else:
+                        module.temp_weight = module.quantize_weight(module.weight)
+                    if not hasattr(module, "temp_bias"):
+                        module.temp_bias = module.bias
+                    module.use_temporary_parameter=True
 
     def clear_temp_variable(self):
         for name, module in self.named_modules():
