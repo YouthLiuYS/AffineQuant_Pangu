@@ -50,7 +50,7 @@ class QuantLinear(nn.Module):
             weight = self.temp_weight
             bias = self.temp_bias
         elif self.use_weight_quant:
-            weight = self.quantize_weight(self.weight)
+            weight = self.weight_quantizer(self.weight)
             bias = self.bias
         else:
             weight = self.weight
@@ -63,14 +63,6 @@ class QuantLinear(nn.Module):
 
 
         return out
-
-    def quantize_weight(self, weight: torch.Tensor):
-        if hasattr(self, "adaround_v") and hasattr(self, "adaround_enabled"):
-            if bool(self.adaround_enabled):
-                zeta = getattr(self, "adaround_zeta", 1.1)
-                gamma = getattr(self, "adaround_gamma", -0.1)
-                return self.weight_quantizer.adaround_quant(weight, self.adaround_v, zeta, gamma)
-        return self.weight_quantizer(weight)
 
     def set_quant_state(self, weight_quant: bool = False, act_quant: bool = False):
         self.use_weight_quant = weight_quant

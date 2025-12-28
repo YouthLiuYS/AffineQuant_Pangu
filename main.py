@@ -352,8 +352,6 @@ def main():
     parser.add_argument("--net", type=str, default=None, choices=net_choices)
     parser.add_argument("--act-scales", type=str, default=None)
     parser.add_argument("--act-shifts", type=str, default=None)
-    parser.add_argument("--adaround", action="store_true", help="enable adaround rounding")
-    parser.add_argument("--adaround-params", type=str, default=None)
     parser.add_argument(
         '--benchmark', type=int, default=0,
         help='Number of tokens to use for benchmarking.'
@@ -396,7 +394,7 @@ def main():
     lm = LMClass(args)
     lm.seqlen = 2048
     lm.model.eval()
-    # print("lm:  ", lm.model.state_dict())
+    print("lm:  ", lm.model.state_dict())
     for param in lm.model.parameters():
         param.requires_grad = False
 
@@ -449,10 +447,6 @@ def main():
         args.act_scales = f'./act_scales/{args.net}.pt'
     if args.act_shifts is None:
         args.act_shifts = f'./act_shifts/{args.net}.pt'
-    if args.adaround_params:
-        args.adaround = True
-    if args.adaround and args.adaround_params is None:
-        args.adaround_params = f'./adaround_params/{args.net}.pt'
 
     # quantization
     if args.wbits < 16 or args.abits <16:
@@ -474,23 +468,18 @@ def main():
             torch.save(dataloader, cache_dataloader)    
         act_scales = None
         act_shifts = None
-        adaround = None
         if args.let:
             act_scales = torch.load(args.act_scales, weights_only=False)
             act_shifts = torch.load(args.act_shifts, weights_only=False)
-        if args.adaround:
-            adaround = torch.load(args.adaround_params, weights_only=False)
         affinequant(
             lm,
             args,
             dataloader,
             act_scales,
             act_shifts,
-            adaround,
             logger,
         )
         logger.info(time.time() - tick)
-
     if args.save_dir:
         # delete affine parameters
         for name, module in lm.model.named_modules():

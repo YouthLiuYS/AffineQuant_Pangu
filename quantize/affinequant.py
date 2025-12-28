@@ -25,7 +25,6 @@ def affinequant(
     dataloader,
     act_scales,
     act_shifts,
-    adaround_params=None,
     logger=None,
 ):
     logger.info("Starting ...")
@@ -207,35 +206,6 @@ def affinequant(
                                 qlayer.register_parameter(f"{pairs[key]}_smooth_shift",torch.nn.Parameter(shift.to(args.dtype)))
                                 qlayer.register_parameter(f"{pairs[key]}_smooth_scale",torch.nn.Parameter(torch.diag(scale.to(args.dtype))))
 
-        if adaround_params:
-            for name, module in qlayer.named_modules():
-                if not isinstance(module, QuantLinear):
-                    continue
-                if hasattr(module, "adaround_enabled"):
-                    continue
-                key = f"{layer_name_prefix}.{i}.{name}"
-                if key not in adaround_params:
-                    continue
-                v = adaround_params[key].to(device=module.weight.device, dtype=module.weight.dtype)
-                module.register_parameter("adaround_v", nn.Parameter(v))
-                module.register_buffer(
-                    "adaround_zeta",
-                    torch.tensor(1.1, dtype=module.weight.dtype, device=module.weight.device),
-                )
-                module.register_buffer(
-                    "adaround_gamma",
-                    torch.tensor(-0.1, dtype=module.weight.dtype, device=module.weight.device),
-                )
-                init_bias = float(v.flatten()[0].item()) if v.numel() > 0 else 0.0
-                module.register_buffer(
-                    "adaround_init_bias",
-                    torch.tensor(init_bias, dtype=module.weight.dtype, device=module.weight.device),
-                )
-                module.register_buffer(
-                    "adaround_enabled",
-                    torch.tensor(True, dtype=torch.bool, device=module.weight.device),
-                )
-
         if args.resume and i < len(affine_parameters):
             qlayer.load_state_dict(affine_parameters[i], strict=False)
         
@@ -244,21 +214,9 @@ def affinequant(
                 qlayer.to(args.dtype)      # required for AMP training
             
             # create optimizer
-            if hasattr(qlayer, "adaround_parameters"):
-                adaround_layer_params = list(qlayer.adaround_parameters())
-            else:
-                adaround_layer_params = []
-            param_groups = [
-                {"params": qlayer.let_parameters(use_shift), "lr": args.let_lr},
-                {"params": qlayer.lwc_parameters(), "lr": args.lwc_lr},
-            ]
-            if adaround_layer_params:
-                param_groups.append({"params": adaround_layer_params, "lr": args.let_lr})
-            optimizer = torch.optim.AdamW(param_groups, weight_decay=args.wd)
+            optimizer = torch.optim.AdamW(
+                [{"params":qlayer.let_parameters(use_shift),"lr":args.let_lr}, {"params":qlayer.lwc_parameters(),"lr":args.lwc_lr}],weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
-            trainable_params = list(qlayer.affine_parameters(use_shift))
-            if adaround_layer_params:
-                trainable_params.extend(adaround_layer_params)
             
             for epochs in range(args.epochs):
                 loss_list = []
@@ -316,7 +274,7 @@ def affinequant(
                         
                     loss_list.append(loss.data)
                     optimizer.zero_grad()
-                    norm = loss_scaler(loss, optimizer, parameters=trainable_params)
+                    norm = loss_scaler(loss, optimizer,parameters=qlayer.affine_parameters(use_shift))
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
@@ -415,3 +373,4 @@ def affinequant(
     gc.collect()                    
     model.config.use_cache = use_cache
     return model.half()
+
