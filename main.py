@@ -367,9 +367,9 @@ def main():
                         help="path to pre-generated adaround parameters")
     parser.add_argument("--adaround-layer-idx", type=int, default=None,
                         help="only apply adaround to specific layer index")
-    parser.add_argument("--adaround-epochs", type=int, default=40,
+    parser.add_argument("--adaround-epochs", type=int, default=5,
                         help="number of epochs for adaround training")
-    parser.add_argument("--adaround-lr", type=float, default=1e-3,
+    parser.add_argument("--adaround-lr", type=float, default=1e-2,
                         help="learning rate for adaround training")
     parser.add_argument("--adaround-init-bias", type=float, default=-5.0,
                         help="initial bias for adaround V matrix")

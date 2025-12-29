@@ -326,9 +326,14 @@ class QuantFalconDecoderLayer(nn.Module):
                 m.set_quant_state(weight_quant, act_quant)
 
     @torch.no_grad()
-    def smooth_and_quant_inplace(self):
+    def smooth_and_quant_inplace(self, num_heads=None, maskqkv=None, maskfc=None, use_matrix=False, use_ln_matrix=False, save_smooth_weight=False):
         if self.let:
             raise ValueError("falcon not yet support let")
+        # Save smooth weights before quantization (for AdaRound initialization)
+        if save_smooth_weight:
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    module.smooth_weight = module.weight.clone()
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 module.weight = module.weight_quantizer(module.weight)

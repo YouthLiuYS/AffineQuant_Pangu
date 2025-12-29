@@ -394,7 +394,7 @@ class QuantOPTDecoderLayer(nn.Module):
                 del module.temp_bias
 
     @torch.no_grad()
-    def smooth_and_quant_inplace(self, num_heads, maskqkv=None, maskfc=None, use_matrix=False, use_ln_matrix=False):
+    def smooth_and_quant_inplace(self, num_heads, maskqkv=None, maskfc=None, use_matrix=False, use_ln_matrix=False, save_smooth_weight=False):
         # return
         if self.let:
             for name, module in self.named_parameters():
@@ -408,6 +408,11 @@ class QuantOPTDecoderLayer(nn.Module):
                                 self.out_smooth_scale, num_heads, maskfc, self.out_smooth_shift)
             smooth_q_k_inplace(self.self_attn.q_proj, self.self_attn.k_proj, maskfc,
                                 self.qkt_smooth_scale,use_matrix=use_matrix)
+        # Save smooth weights before quantization (for AdaRound initialization)
+        if save_smooth_weight:
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    module.smooth_weight = module.weight.clone()
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 module.weight = module.weight_quantizer(module.weight)

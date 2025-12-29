@@ -113,8 +113,10 @@ class QuantLinear(nn.Module):
             # Check for AdaRound mode
             if (self.weight_quantizer.adaround_mode and
                 hasattr(self, 'adaround_enabled') and self.adaround_enabled):
+                # Use smooth_weight for AdaRound quantization (if available)
+                w_input = self.smooth_weight if hasattr(self, 'smooth_weight') else self.weight
                 weight = adaround_fake_quant(
-                    self.weight,
+                    w_input,
                     self.weight_quantizer,
                     self.adaround_V,
                     self.adaround_zeta.item(),
