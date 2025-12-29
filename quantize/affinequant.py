@@ -330,18 +330,15 @@ def affinequant(
         if args.resume and i < len(affine_parameters):
             qlayer.load_state_dict(affine_parameters[i], strict=False)
         
-        # Check if AdaRound will be applied to this layer
-        do_adaround = getattr(args, 'adaround', False) and (getattr(args, 'adaround_layer_idx', None) is None or i == args.adaround_layer_idx)
-
         if args.epochs > 0 and not (args.resume and i < len(affine_parameters)):
             with torch.no_grad():
                 qlayer.to(args.dtype)      # required for AMP training
-
+            
             # create optimizer
             optimizer = torch.optim.AdamW(
                 [{"params":qlayer.let_parameters(use_shift),"lr":args.let_lr}, {"params":qlayer.lwc_parameters(),"lr":args.lwc_lr}],weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
-
+            
             for epochs in range(args.epochs):
                 loss_list = []
                 norm_list = []
@@ -349,7 +346,7 @@ def affinequant(
                 # gradual mask
                 qkvmask_num = int((lm.model.config.hidden_size-1)/(args.epochs-1)*epochs)+1
                 fc1mask_num = int((lm.model.config.hidden_size/lm.model.config.num_attention_heads-1)/(args.epochs-1)*epochs)+1
-
+                
                 values = torch.tensor([1 for i1 in range(qlayer.self_attn.q_proj.weight.data.size(1))]).cuda()
                 maskqkv = torch.zeros(qlayer.self_attn.q_proj.weight.data.size(1), qlayer.self_attn.q_proj.weight.data.size(1)).cuda()
                 for i1 in range(qkvmask_num):
@@ -361,14 +358,14 @@ def affinequant(
                         mask2 = torch.diag(args.sf*values[:len(values)-i1], -i1)
                     maskqkv = maskqkv + mask1 + mask2
                 maskqkv = maskqkv - torch.eye(qlayer.self_attn.q_proj.weight.data.size(1)).cuda()
-
+                
                 if "opt" in args.net.lower():
                     maskfc = torch.zeros([qlayer.self_attn.out_proj.weight.data.size(0), qlayer.self_attn.out_proj.weight.data.size(1)]).cuda()
                     head_size = qlayer.self_attn.out_proj.weight.data.size(0)//lm.model.config.num_attention_heads
                 elif "llama" in args.net.lower():
                     maskfc = torch.zeros([qlayer.self_attn.o_proj.weight.data.size(0), qlayer.self_attn.o_proj.weight.data.size(1)]).cuda()
                     head_size = qlayer.self_attn.o_proj.weight.data.size(0)//lm.model.config.num_attention_heads
-
+                
                 values1 = torch.tensor([1 for i1 in range(head_size)]).cuda()
                 ones = torch.zeros(head_size, head_size).cuda()
                 for i1 in range(fc1mask_num):
@@ -382,13 +379,12 @@ def affinequant(
                 ones = ones - torch.eye(head_size).cuda()
                 for i1 in range(lm.model.config.num_attention_heads):
                     maskfc[i1*head_size:(i1+1)*head_size, i1*head_size:(i1+1)*head_size] = ones
-
-                for j in range(args.nsamples//args.batch_size):
+                    
+                for j in range(args.nsamples//args.batch_size):  
                     index = j * args.batch_size
                     # obtain output of quantization model
                     with traincast():
-                        # Save smooth weights if AdaRound is enabled (for V initialization)
-                        qlayer.smooth_and_quant_temporary(lm.model.config.num_attention_heads, maskqkv, maskfc, use_matrix=use_matrix, use_ln_matrix=use_ln_matrix, save_smooth_weight=do_adaround)
+                        qlayer.smooth_and_quant_temporary(lm.model.config.num_attention_heads, maskqkv, maskfc, use_matrix=use_matrix, use_ln_matrix=use_ln_matrix)
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
@@ -396,7 +392,7 @@ def affinequant(
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
-
+                        
                     loss_list.append(loss.data)
                     optimizer.zero_grad()
                     norm = loss_scaler(loss, optimizer,parameters=qlayer.affine_parameters(use_shift))
@@ -404,194 +400,7 @@ def affinequant(
 
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
-                logger.info(f"layer {i} epoch {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
-
-                # === Per-Epoch AdaRound Stage ===
-                if do_adaround:
-                    logger.info(f"=== Start AdaRound training for layer {i} epoch {epochs} ===")
-
-                    # Freeze let/lwc parameters during AdaRound
-                    for param in qlayer.let_parameters(use_shift):
-                        param.requires_grad = False
-                    for param in qlayer.lwc_parameters():
-                        param.requires_grad = False
-
-                    # IMPORTANT: Disable temporary parameter mode so forward uses adaround path
-                    # (use_temporary_parameter takes precedence over adaround in forward)
-                    named_linears = get_named_linears(qlayer)
-                    for sub_name, module in named_linears.items():
-                        module.use_temporary_parameter = False
-
-                    # Enable weight quant so forward uses adaround_fake_quant path
-                    qlayer.set_quant_state(weight_quant=True, act_quant=True)
-                    adaround_V_list = []
-                    adaround_module_info = []  # (full_name, module, V)
-
-                    for sub_name, module in named_linears.items():
-                        full_name = f"{layer_name_prefix}.{i}.{sub_name}"
-
-                        # Remove previous epoch's adaround params if exist
-                        if hasattr(module, 'adaround_enabled') and module.adaround_enabled:
-                            del module.adaround_V
-                            del module.adaround_zeta
-                            del module.adaround_gamma
-                            module.adaround_enabled = False
-
-                        V = init_adaround_params_for_module(
-                            module, full_name, adaround_params,
-                            args.adaround_init_bias, args.adaround_zeta, args.adaround_gamma,
-                            dev, args.dtype,
-                            use_smooth_init=True  # Initialize based on smooth weight's round-to-nearest
-                        )
-                        adaround_V_list.append(V)
-                        adaround_module_info.append((full_name, module, V))
-                        # Enable adaround mode in quantizer
-                        module.weight_quantizer.adaround_mode = True
-
-                    # Create optimizer for AdaRound V parameters only
-                    adaround_optimizer = torch.optim.AdamW(adaround_V_list, lr=args.adaround_lr)
-                    adaround_loss_scaler = utils.NativeScalerWithGradNormCount()
-
-                    # Beta annealing: linear decay from beta_start to beta_end
-                    beta_start = args.adaround_beta_start
-                    beta_end = args.adaround_beta_end
-                    adaround_reg_coef = args.adaround_reg
-
-                    for adaround_epoch in range(args.adaround_epochs):
-                        # Compute current beta (annealing)
-                        if args.adaround_epochs > 1:
-                            beta = beta_start + (beta_end - beta_start) * adaround_epoch / (args.adaround_epochs - 1)
-                        else:
-                            beta = beta_end
-
-                        adaround_task_loss_list = []
-                        adaround_reg_loss_list = []
-                        adaround_total_loss_list = []
-                        adaround_norm_list = []
-
-                        for j in range(args.nsamples // args.batch_size):
-                            index = j * args.batch_size
-
-                            with traincast():
-                                # Forward with adaround (soft mode)
-                                quant_out = qlayer(quant_inps[index:index+args.batch_size,],
-                                                   attention_mask=attention_mask_batch,
-                                                   position_ids=position_ids)[0]
-                                # Task loss (reconstruction loss)
-                                task_loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
-                                if args.aug_loss:
-                                    task_loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-
-                                # Regularization loss (L_com)
-                                reg_loss = 0
-                                for _, module, V in adaround_module_info:
-                                    reg_loss += adaround_reg_loss(
-                                        V, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
-                                    )
-
-                                total_loss = task_loss + adaround_reg_coef * reg_loss
-
-                            if not math.isfinite(total_loss.item()):
-                                logger.info("AdaRound Loss is NAN, stopping training")
-                                pdb.set_trace()
-
-                            adaround_task_loss_list.append(task_loss.data)
-                            adaround_reg_loss_list.append(reg_loss.data if isinstance(reg_loss, torch.Tensor) else torch.tensor(reg_loss))
-                            adaround_total_loss_list.append(total_loss.data)
-                            adaround_optimizer.zero_grad()
-                            norm = adaround_loss_scaler(total_loss, adaround_optimizer, parameters=adaround_V_list)
-                            adaround_norm_list.append(norm.data)
-
-                        task_loss_mean = torch.stack(adaround_task_loss_list).mean()
-                        reg_loss_mean = torch.stack(adaround_reg_loss_list).mean()
-                        total_loss_mean = torch.stack(adaround_total_loss_list).mean()
-                        adaround_norm_mean = torch.stack(adaround_norm_list).mean()
-                        logger.info(f"layer {i} epoch {epochs} adaround_iter {adaround_epoch} "
-                                    f"recon_loss:{task_loss_mean:.10f} reg_loss:{reg_loss_mean:.10f} "
-                                    f"total_loss:{total_loss_mean:.10f} beta:{beta:.2f} norm:{adaround_norm_mean:.6f}")
-
-                    del adaround_optimizer
-
-                    # Hardening: apply hard rounding and write back to weights
-                    with torch.no_grad():
-                        for full_name, module, V in adaround_module_info:
-                            # Disable adaround mode in quantizer
-                            module.weight_quantizer.adaround_mode = False
-
-                            # Compute hard h
-                            h_hard = get_adaround_h(V, module.adaround_zeta.item(),
-                                                    module.adaround_gamma.item(), hard=True)
-
-                            # Use smooth_weight for final quantization (same as training)
-                            smooth_weight = module.smooth_weight if hasattr(module, 'smooth_weight') else module.weight
-                            quantizer = module.weight_quantizer
-
-                            # Apply the same reshape/pad logic as fake_quant
-                            w = smooth_weight.clone()
-                            deficiency = quantizer.deficiency
-                            group_size = quantizer.group_size
-
-                            if deficiency > 0:
-                                pad_zeros = torch.zeros((w.shape[0], deficiency), dtype=w.dtype, device=w.device)
-                                w = torch.cat((w, pad_zeros), dim=1)
-
-                            # Prepare h for reshape
-                            if deficiency > 0:
-                                h_pad = torch.zeros((h_hard.shape[0], deficiency), dtype=h_hard.dtype, device=h_hard.device)
-                                h_padded = torch.cat((h_hard, h_pad), dim=1)
-                            else:
-                                h_padded = h_hard
-
-                            if group_size:
-                                dim1, dim2 = w.shape
-                                w = w.reshape(-1, group_size)
-                                h_flat = h_padded.reshape(-1, group_size)
-                            else:
-                                h_flat = h_padded
-
-                            # Calibrate scale/zero using smooth weight
-                            quantizer.per_token_dynamic_calibration(w)
-                            scale = quantizer.scale
-                            round_zero_point = quantizer.round_zero_point
-
-                            # floor(w/scale) + h_hard
-                            w_floor = torch.floor(w / scale)
-                            w_int = w_floor + h_flat
-                            if round_zero_point is not None:
-                                w_int = w_int.add(round_zero_point)
-                            w_int = w_int.clamp(quantizer.qmin, quantizer.qmax)
-
-                            # Dequant
-                            w_dequant = w_int
-                            if round_zero_point is not None:
-                                w_dequant = w_dequant.sub(round_zero_point)
-                            w_dequant = w_dequant.mul(scale)
-
-                            if group_size:
-                                w_dequant = w_dequant.reshape(dim1, dim2)
-                            if deficiency > 0:
-                                w_dequant = w_dequant[:, :-deficiency]
-
-                            # Write back to weight buffer
-                            module.weight.copy_(w_dequant)
-
-                            # Clean up adaround params and smooth_weight
-                            del module.adaround_V
-                            del module.adaround_zeta
-                            del module.adaround_gamma
-                            if hasattr(module, 'smooth_weight'):
-                                del module.smooth_weight
-                            module.adaround_enabled = False
-
-                    # Restore quant state for next epoch
-                    qlayer.set_quant_state(weight_quant=False, act_quant=True)
-                    logger.info(f"=== AdaRound hardening done for layer {i} epoch {epochs} ===")
-
-                    # Re-enable let/lwc parameters for next epoch
-                    for param in qlayer.let_parameters(use_shift):
-                        param.requires_grad = True
-                    for param in qlayer.lwc_parameters():
-                        param.requires_grad = True
+                logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
 
             qlayer.clear_temp_variable()
             del optimizer
@@ -633,12 +442,205 @@ def affinequant(
                 maskfc[i1*head_size:(i1+1)*head_size, i1*head_size:(i1+1)*head_size] = ones
 
 
+        # Check if AdaRound will be applied to this layer
+        do_adaround = getattr(args, 'adaround', False) and (getattr(args, 'adaround_layer_idx', None) is None or i == args.adaround_layer_idx)
+
         # real smooth and quantization
-        # Note: For per-epoch AdaRound, weights have been written back after each epoch's AdaRound.
-        # smooth_and_quant_inplace applies the final smooth transformation.
+        # Save smooth weights before quantization if AdaRound is enabled
         qlayer.smooth_and_quant_inplace(lm.model.config.num_attention_heads, maskqkv, maskfc,
                                         use_matrix=use_matrix, use_ln_matrix=use_ln_matrix,
-                                        save_smooth_weight=False)
+                                        save_smooth_weight=do_adaround)
+
+        # === AdaRound Stage ===
+        # Only run if --adaround is enabled and (no layer specified or this layer matches)
+        if do_adaround:
+            logger.info(f"=== Start AdaRound training for layer {i} ===")
+
+            # Freeze let/lwc parameters
+            for param in qlayer.let_parameters(use_shift):
+                param.requires_grad = False
+            for param in qlayer.lwc_parameters():
+                param.requires_grad = False
+
+            # IMPORTANT: Enable weight quant so forward uses adaround_fake_quant path
+            qlayer.set_quant_state(weight_quant=True, act_quant=True)
+            logger.info(f"AdaRound: set weight_quant=True for layer {i}")
+
+            # Initialize adaround params for all QuantLinear in this layer
+            # Use smooth weight's round-to-nearest for V initialization
+            named_linears = get_named_linears(qlayer)
+            adaround_V_list = []
+            adaround_module_info = []  # (full_name, module, V)
+
+            for sub_name, module in named_linears.items():
+                full_name = f"{layer_name_prefix}.{i}.{sub_name}"
+                V = init_adaround_params_for_module(
+                    module, full_name, adaround_params,
+                    args.adaround_init_bias, args.adaround_zeta, args.adaround_gamma,
+                    dev, args.dtype,
+                    use_smooth_init=True  # Initialize based on smooth weight's round-to-nearest
+                )
+                adaround_V_list.append(V)
+                adaround_module_info.append((full_name, module, V))
+                # Enable adaround mode in quantizer
+                module.weight_quantizer.adaround_mode = True
+
+            # Create optimizer for AdaRound V parameters only
+            adaround_optimizer = torch.optim.AdamW(adaround_V_list, lr=args.adaround_lr)
+            adaround_loss_scaler = utils.NativeScalerWithGradNormCount()
+
+            # Beta annealing: linear decay from beta_start to beta_end
+            beta_start = args.adaround_beta_start
+            beta_end = args.adaround_beta_end
+            adaround_reg_coef = args.adaround_reg
+
+            for adaround_epoch in range(args.adaround_epochs):
+                # Compute current beta (annealing)
+                if args.adaround_epochs > 1:
+                    beta = beta_start + (beta_end - beta_start) * adaround_epoch / (args.adaround_epochs - 1)
+                else:
+                    beta = beta_end
+
+                adaround_task_loss_list = []
+                adaround_reg_loss_list = []
+                adaround_total_loss_list = []
+                adaround_norm_list = []
+
+                for j in range(args.nsamples // args.batch_size):
+                    index = j * args.batch_size
+
+                    with traincast():
+                        # Forward with adaround (soft mode)
+                        quant_out = qlayer(quant_inps[index:index+args.batch_size,],
+                                           attention_mask=attention_mask_batch,
+                                           position_ids=position_ids)[0]
+                        # Task loss (reconstruction loss)
+                        task_loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                        if args.aug_loss:
+                            task_loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+
+                        # Regularization loss (L_com)
+                        reg_loss = 0
+                        for _, module, V in adaround_module_info:
+                            reg_loss += adaround_reg_loss(
+                                V, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
+                            )
+
+                        total_loss = task_loss + adaround_reg_coef * reg_loss
+
+                    if not math.isfinite(total_loss.item()):
+                        logger.info("AdaRound Loss is NAN, stopping training")
+                        pdb.set_trace()
+
+                    adaround_task_loss_list.append(task_loss.data)
+                    adaround_reg_loss_list.append(reg_loss.data if isinstance(reg_loss, torch.Tensor) else torch.tensor(reg_loss))
+                    adaround_total_loss_list.append(total_loss.data)
+                    adaround_optimizer.zero_grad()
+                    norm = adaround_loss_scaler(total_loss, adaround_optimizer, parameters=adaround_V_list)
+                    adaround_norm_list.append(norm.data)
+
+                task_loss_mean = torch.stack(adaround_task_loss_list).mean()
+                reg_loss_mean = torch.stack(adaround_reg_loss_list).mean()
+                total_loss_mean = torch.stack(adaround_total_loss_list).mean()
+                adaround_norm_mean = torch.stack(adaround_norm_list).mean()
+                logger.info(f"layer {i} adaround epoch {adaround_epoch} "
+                            f"recon_loss:{task_loss_mean:.10f} reg_loss:{reg_loss_mean:.10f} "
+                            f"total_loss:{total_loss_mean:.10f} beta:{beta:.2f} norm:{adaround_norm_mean:.6f}")
+
+            del adaround_optimizer
+
+            # Save adaround parameters before hardening (for analysis/debugging)
+            adaround_save_dict = {}
+            for full_name, module, V in adaround_module_info:
+                adaround_save_dict[full_name] = V.detach().cpu().clone()
+            adaround_save_path = os.path.join(args.output_dir, f"adaround_params_layer{i}.pth")
+            torch.save(adaround_save_dict, adaround_save_path)
+            logger.info(f"Saved adaround params to {adaround_save_path}")
+
+            # Hardening: apply hard rounding and write back to weights
+            with torch.no_grad():
+                for full_name, module, V in adaround_module_info:
+                    # Disable adaround mode in quantizer
+                    module.weight_quantizer.adaround_mode = False
+
+                    # Compute hard h
+                    h_hard = get_adaround_h(V, module.adaround_zeta.item(),
+                                            module.adaround_gamma.item(), hard=True)
+
+                    # Use smooth_weight for final quantization (same as training)
+                    smooth_weight = module.smooth_weight if hasattr(module, 'smooth_weight') else module.weight
+                    quantizer = module.weight_quantizer
+
+                    # Apply the same reshape/pad logic as fake_quant
+                    w = smooth_weight.clone()
+                    deficiency = quantizer.deficiency
+                    group_size = quantizer.group_size
+
+                    if deficiency > 0:
+                        pad_zeros = torch.zeros((w.shape[0], deficiency), dtype=w.dtype, device=w.device)
+                        w = torch.cat((w, pad_zeros), dim=1)
+
+                    # Prepare h for reshape
+                    if deficiency > 0:
+                        h_pad = torch.zeros((h_hard.shape[0], deficiency), dtype=h_hard.dtype, device=h_hard.device)
+                        h_padded = torch.cat((h_hard, h_pad), dim=1)
+                    else:
+                        h_padded = h_hard
+
+                    if group_size:
+                        dim1, dim2 = w.shape
+                        w = w.reshape(-1, group_size)
+                        h_flat = h_padded.reshape(-1, group_size)
+                    else:
+                        h_flat = h_padded
+
+                    # Calibrate scale/zero using smooth weight
+                    quantizer.per_token_dynamic_calibration(w)
+                    scale = quantizer.scale
+                    round_zero_point = quantizer.round_zero_point
+
+                    # floor(w/scale) + h_hard
+                    w_floor = torch.floor(w / scale)
+                    w_int = w_floor + h_flat
+                    if round_zero_point is not None:
+                        w_int = w_int.add(round_zero_point)
+                    w_int = w_int.clamp(quantizer.qmin, quantizer.qmax)
+
+                    # Dequant
+                    w_dequant = w_int
+                    if round_zero_point is not None:
+                        w_dequant = w_dequant.sub(round_zero_point)
+                    w_dequant = w_dequant.mul(scale)
+
+                    if group_size:
+                        w_dequant = w_dequant.reshape(dim1, dim2)
+                    if deficiency > 0:
+                        w_dequant = w_dequant[:, :-deficiency]
+
+                    # Write back to weight buffer
+                    module.weight.copy_(w_dequant)
+
+                    # IMPORTANT: Disable weight quantization since weight is already quantized
+                    # This prevents the weight_quantizer from re-quantizing the AdaRound-optimized weight
+                    module.use_weight_quant = False
+
+                    # Clean up adaround params and smooth_weight
+                    del module.adaround_V
+                    del module.adaround_zeta
+                    del module.adaround_gamma
+                    if hasattr(module, 'smooth_weight'):
+                        del module.smooth_weight
+                    module.adaround_enabled = False
+
+            # Restore quant state: disable weight quant since weights are already quantized
+            qlayer.set_quant_state(weight_quant=False, act_quant=True)
+            logger.info(f"=== AdaRound hardening done for layer {i}, set weight_quant=False ===")
+
+            # Re-enable let/lwc parameters (in case needed later)
+            for param in qlayer.let_parameters(use_shift):
+                param.requires_grad = True
+            for param in qlayer.lwc_parameters():
+                param.requires_grad = True
 
         if args.epochs>0:
             # update input of quantization model

@@ -333,7 +333,7 @@ class QuantFalconDecoderLayer(nn.Module):
         if save_smooth_weight:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
-                    module.smooth_weight = module.weight.detach().clone()
+                    module.smooth_weight = module.weight.clone()
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 module.weight = module.weight_quantizer(module.weight)
