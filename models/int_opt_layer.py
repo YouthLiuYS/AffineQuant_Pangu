@@ -356,8 +356,8 @@ class QuantOPTDecoderLayer(nn.Module):
                 m.set_quant_state(weight_quant, act_quant)
 
 
-    def smooth_and_quant_temporary(self, num_heads, maskqkv, maskfc, maskqkv_1=None, maskfc_1=None, use_matrix=False, use_ln_matrix=False):
-        
+    def smooth_and_quant_temporary(self, num_heads, maskqkv, maskfc, maskqkv_1=None, maskfc_1=None, use_matrix=False, use_ln_matrix=False, save_smooth_weight=False):
+
         if self.let:
             with torch.no_grad():
                 for name, module in self.named_parameters():
@@ -376,6 +376,14 @@ class QuantOPTDecoderLayer(nn.Module):
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
                     module.temp_weight = module.weight
+        # Save smooth weights before quantization (for AdaRound)
+        if save_smooth_weight:
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    if hasattr(module, "temp_weight"):
+                        module.smooth_weight = module.temp_weight.detach().clone()
+                    else:
+                        module.smooth_weight = module.weight.detach().clone()
         # quant
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
@@ -412,7 +420,7 @@ class QuantOPTDecoderLayer(nn.Module):
         if save_smooth_weight:
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
-                    module.smooth_weight = module.weight.clone()
+                    module.smooth_weight = module.weight.detach().clone()
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 module.weight = module.weight_quantizer(module.weight)
