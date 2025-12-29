@@ -360,6 +360,29 @@ def main():
         '--check', action='store_true',
         help='Whether to compute perplexity during benchmarking for verification.'
     )
+    # AdaRound parameters
+    parser.add_argument("--adaround", default=False, action="store_true",
+                        help="activate AdaRound optimization after AffineQuant")
+    parser.add_argument("--adaround-params", type=str, default=None,
+                        help="path to pre-generated adaround parameters")
+    parser.add_argument("--adaround-layer-idx", type=int, default=None,
+                        help="only apply adaround to specific layer index")
+    parser.add_argument("--adaround-epochs", type=int, default=40,
+                        help="number of epochs for adaround training")
+    parser.add_argument("--adaround-lr", type=float, default=1e-3,
+                        help="learning rate for adaround training")
+    parser.add_argument("--adaround-init-bias", type=float, default=-5.0,
+                        help="initial bias for adaround V matrix")
+    parser.add_argument("--adaround-zeta", type=float, default=1.1,
+                        help="zeta parameter for adaround rectified sigmoid")
+    parser.add_argument("--adaround-gamma", type=float, default=-0.1,
+                        help="gamma parameter for adaround rectified sigmoid")
+    parser.add_argument("--adaround-beta-start", type=float, default=20.0,
+                        help="starting beta for adaround regularization annealing")
+    parser.add_argument("--adaround-beta-end", type=float, default=2.0,
+                        help="ending beta for adaround regularization annealing")
+    parser.add_argument("--adaround-reg", type=float, default=0.01,
+                        help="regularization coefficient for adaround")
 
     args = parser.parse_args()
     random.seed(args.seed)
@@ -448,10 +471,14 @@ def main():
     if args.act_shifts is None:
         args.act_shifts = f'./act_shifts/{args.net}.pt'
 
+    # adaround params path
+    if args.adaround and args.adaround_params is None:
+        args.adaround_params = f'./adaround_params/{args.net}.pt'
+
     # quantization
     if args.wbits < 16 or args.abits <16:
         logger.info("=== start quantization ===")
-        tick = time.time()     
+        tick = time.time()
         # load calibration dataset
         cache_dataloader = f'{args.cache_dir}/dataloader_{args.model_family}_{args.calib_dataset}_{args.nsamples}.cache'
         if os.path.exists(cache_dataloader):
@@ -465,12 +492,17 @@ def main():
                 model=args.model,
                 seqlen=lm.seqlen,
             )
-            torch.save(dataloader, cache_dataloader)    
+            torch.save(dataloader, cache_dataloader)
         act_scales = None
         act_shifts = None
         if args.let:
             act_scales = torch.load(args.act_scales, weights_only=False)
             act_shifts = torch.load(args.act_shifts, weights_only=False)
+        # load adaround params if available
+        adaround_params = None
+        if args.adaround and args.adaround_params and os.path.exists(args.adaround_params):
+            adaround_params = torch.load(args.adaround_params, weights_only=False)
+            logger.info(f"load adaround params from {args.adaround_params}")
         affinequant(
             lm,
             args,
@@ -478,6 +510,7 @@ def main():
             act_scales,
             act_shifts,
             logger,
+            adaround_params=adaround_params,
         )
         logger.info(time.time() - tick)
     if args.save_dir:

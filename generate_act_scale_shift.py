@@ -13,6 +13,11 @@ from datasets import load_dataset
 import functools
 from tqdm import tqdm
 from datautils import get_loaders
+
+try:
+    from quantize.int_linear import QuantLinear
+except ImportError:
+    QuantLinear = None
 # try:
 #     from llava.model import *   # required for llava
 # except ImportError:
@@ -94,6 +99,29 @@ def get_act_shifts(model, dataloader, num_samples=128):
     return act_shifts
 
 
+def get_adaround(model, init_bias=-5.0, zeta=1.1, gamma=-0.1):
+    """
+    Initialize AdaRound parameters (V matrix) for linear layers.
+    For AutoModelForCausalLM (nn.Linear), generates parameter dict only.
+    Returns: dict[name -> Tensor] for all linear layer weights.
+    """
+    adaround_params = {}
+
+    for name, m in model.named_modules():
+        # Prefer QuantLinear if available, fallback to nn.Linear
+        if QuantLinear is not None and isinstance(m, QuantLinear):
+            weight = m.weight
+        elif isinstance(m, nn.Linear):
+            weight = m.weight
+        else:
+            continue
+
+        # Initialize V with constant init_bias (negative value)
+        # V shape matches weight shape: (out_features, in_features)
+        V = torch.full_like(weight, init_bias, dtype=torch.float32)
+        adaround_params[name] = V.cpu()
+
+    return adaround_params
 
 
 def build_model_and_tokenizer(model_name):
@@ -116,6 +144,17 @@ def parse_args():
     parser.add_argument('--num-samples', type=int, default=128)
     parser.add_argument('--seq-len', type=int, default=2048)
     parser.add_argument("--seed", type=int, default=2, help="Seed for sampling the calibration data.")
+    # AdaRound parameters
+    parser.add_argument('--adaround-output-path', type=str, default='./adaround_params/',
+                        help='where to save the adaround parameters')
+    parser.add_argument('--adaround-init-bias', type=float, default=-5.0,
+                        help='initial bias for adaround V matrix')
+    parser.add_argument('--adaround-zeta', type=float, default=1.1,
+                        help='zeta parameter for adaround rectified sigmoid')
+    parser.add_argument('--adaround-gamma', type=float, default=-0.1,
+                        help='gamma parameter for adaround rectified sigmoid')
+    parser.add_argument('--generate-adaround', action='store_true',
+                        help='generate adaround parameters')
     args = parser.parse_args()
     return args
 
@@ -131,7 +170,7 @@ def main():
     model=args.model,
     seqlen=args.seq_len,
     )
-    
+
     args.net = args.model.split('/')[-1]
     act_scales = get_act_scales(model, dataloader,args.num_samples)
     save_path = os.path.join(args.scales_output_path,f'{args.net}.pt')
@@ -142,6 +181,19 @@ def main():
     save_path = os.path.join(args.shifts_output_path,f'{args.net}.pt')
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(act_shifts, save_path)
+
+    # Generate and save AdaRound parameters if requested
+    if args.generate_adaround:
+        adaround_params = get_adaround(
+            model,
+            init_bias=args.adaround_init_bias,
+            zeta=args.adaround_zeta,
+            gamma=args.adaround_gamma
+        )
+        save_path = os.path.join(args.adaround_output_path, f'{args.net}.pt')
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        torch.save(adaround_params, save_path)
+        print(f"AdaRound parameters saved to {save_path}")
 
 
 if __name__ == '__main__':

@@ -76,6 +76,9 @@ class UniformAffineQuantizer(nn.Module):
         self.enable = True
         self.group_size = group_size
 
+        # AdaRound mode flag (set by affinequant during training)
+        self.adaround_mode = False
+
     def change_n_bits(self, n_bits):
         self.n_bits = n_bits
         self.qmin = 0
