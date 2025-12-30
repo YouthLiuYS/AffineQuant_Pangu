@@ -99,11 +99,15 @@ def get_act_shifts(model, dataloader, num_samples=128):
     return act_shifts
 
 
-def get_adaround(model, init_bias=0.0, zeta=1.1, gamma=-0.1):
+def get_adaround(model, rank=16, init_bias=0.0, zeta=1.1, gamma=-0.1):
     """
-    Initialize AdaRound parameters (V matrix) for linear layers.
-    For AutoModelForCausalLM (nn.Linear), generates parameter dict only.
-    Returns: dict[name -> Tensor] for all linear layer weights.
+    Initialize LoRA-AdaRound parameters (A1, A2 matrices) for linear layers.
+    V = A1 @ A2 is the rounding parameter matrix.
+    A1: (out_features, rank) - Gaussian random init (std=0.01)
+    A2: (rank, in_features) - Zero init
+    Initial V = A1 @ A2 = 0, so h = sigmoid(0) * (zeta - gamma) + gamma = 0.5 (round-to-nearest)
+
+    Returns: dict[name.A1 -> Tensor, name.A2 -> Tensor] for all linear layer weights.
     """
     adaround_params = {}
 
@@ -116,10 +120,17 @@ def get_adaround(model, init_bias=0.0, zeta=1.1, gamma=-0.1):
         else:
             continue
 
-        # Initialize V with constant init_bias (negative value)
-        # V shape matches weight shape: (out_features, in_features)
-        V = torch.full_like(weight, init_bias, dtype=torch.float32)
-        adaround_params[name] = V.cpu()
+        out_features, in_features = weight.shape
+
+        # LoRA-style decomposition: V = A1 @ A2
+        # A1: (out_features, rank) - Gaussian random init
+        # A2: (rank, in_features) - Zero init
+        # Initial V = A1 @ A2 = 0 (due to A2 being zero), so h = 0.5 (round-to-nearest)
+        A1 = torch.randn(out_features, rank, dtype=torch.float32) * 0.01
+        A2 = torch.zeros(rank, in_features, dtype=torch.float32)
+
+        adaround_params[f"{name}.A1"] = A1.cpu()
+        adaround_params[f"{name}.A2"] = A2.cpu()
 
     return adaround_params
 
@@ -147,6 +158,8 @@ def parse_args():
     # AdaRound parameters
     parser.add_argument('--adaround-output-path', type=str, default='./adaround_params/',
                         help='where to save the adaround parameters')
+    parser.add_argument('--adaround-rank', type=int, default=16,
+                        help='rank for LoRA-AdaRound decomposition (V = A1 @ A2)')
     parser.add_argument('--adaround-init-bias', type=float, default=0.0,
                         help='initial bias for adaround V matrix (0.0 gives h=0.5, i.e. round-to-nearest)')
     parser.add_argument('--adaround-zeta', type=float, default=1.1,
@@ -182,10 +195,11 @@ def main():
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(act_shifts, save_path)
 
-    # Generate and save AdaRound parameters if requested
+    # Generate and save LoRA-AdaRound parameters if requested
     if args.generate_adaround:
         adaround_params = get_adaround(
             model,
+            rank=args.adaround_rank,
             init_bias=args.adaround_init_bias,
             zeta=args.adaround_zeta,
             gamma=args.adaround_gamma
@@ -193,7 +207,7 @@ def main():
         save_path = os.path.join(args.adaround_output_path, f'{args.net}.pt')
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         torch.save(adaround_params, save_path)
-        print(f"AdaRound parameters saved to {save_path}")
+        print(f"LoRA-AdaRound parameters (rank={args.adaround_rank}) saved to {save_path}")
 
 
 if __name__ == '__main__':

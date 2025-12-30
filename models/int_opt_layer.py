@@ -390,7 +390,8 @@ class QuantOPTDecoderLayer(nn.Module):
                     module.temp_weight = adaround_fake_quant(
                         w_to_quant,
                         module.weight_quantizer,
-                        module.adaround_V,
+                        module.adaround_A1,
+                        module.adaround_A2,
                         module.adaround_zeta.item(),
                         module.adaround_gamma.item()
                     )

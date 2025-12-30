@@ -369,7 +369,7 @@ def main():
                         help="only apply adaround to specific layer index")
     parser.add_argument("--adaround-epochs", type=int, default=5,
                         help="number of epochs for adaround training")
-    parser.add_argument("--adaround-lr", type=float, default=1e-4,
+    parser.add_argument("--adaround-lr", type=float, default=5e-3,
                         help="learning rate for adaround training")
     parser.add_argument("--adaround-init-bias", type=float, default=0.0,
                         help="initial bias for adaround V matrix (0.0 gives h=0.5, i.e. round-to-nearest)")
@@ -377,12 +377,14 @@ def main():
                         help="zeta parameter for adaround rectified sigmoid")
     parser.add_argument("--adaround-gamma", type=float, default=-0.1,
                         help="gamma parameter for adaround rectified sigmoid")
-    parser.add_argument("--adaround-beta-start", type=float, default=20.0,
+    parser.add_argument("--adaround-beta-start", type=float, default=3.0,
                         help="starting beta for adaround regularization annealing")
-    parser.add_argument("--adaround-beta-end", type=float, default=2.0,
+    parser.add_argument("--adaround-beta-end", type=float, default=30.0,
                         help="ending beta for adaround regularization annealing")
-    parser.add_argument("--adaround-reg", type=float, default=1e-4,
+    parser.add_argument("--adaround-reg", type=float, default=1e-10,
                         help="regularization coefficient for adaround")
+    parser.add_argument("--adaround-rank", type=int, default=16,
+                        help="rank for LoRA-AdaRound decomposition (V = A1 @ A2)")
 
     args = parser.parse_args()
     random.seed(args.seed)

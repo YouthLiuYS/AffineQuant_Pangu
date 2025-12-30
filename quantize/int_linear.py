@@ -12,16 +12,21 @@ def floor_ste(x: torch.Tensor):
     return (x.floor() - x).detach() + x
 
 
-def adaround_fake_quant(x, quantizer, V, zeta, gamma):
+def adaround_fake_quant(x, quantizer, A1, A2, zeta, gamma):
     """
-    Perform AdaRound quantization with soft rounding.
+    Perform LoRA-AdaRound quantization with soft rounding.
     x: input weight tensor (smoothed weight from LET/LWC)
     quantizer: UniformAffineQuantizer instance
-    V: learnable rounding parameter (same shape as x)
+    A1: (out_features, rank) - first LoRA matrix
+    A2: (rank, in_features) - second LoRA matrix
+    V = A1 @ A2 is the rounding parameter matrix
     zeta, gamma: rectified sigmoid parameters
 
     Uses STE for floor operation to allow gradient flow to LET/LWC parameters.
     """
+    # Compute V = A1 @ A2 (LoRA decomposition)
+    V = A1 @ A2
+
     deficiency = quantizer.deficiency
     group_size = quantizer.group_size
 
@@ -121,7 +126,7 @@ class QuantLinear(nn.Module):
             weight = self.temp_weight
             bias = self.temp_bias
         elif self.use_weight_quant:
-            # Check for AdaRound mode
+            # Check for AdaRound mode (LoRA-AdaRound uses A1, A2)
             if (self.weight_quantizer.adaround_mode and
                 hasattr(self, 'adaround_enabled') and self.adaround_enabled):
                 # Use smooth_weight for AdaRound quantization (if available)
@@ -129,7 +134,8 @@ class QuantLinear(nn.Module):
                 weight = adaround_fake_quant(
                     w_input,
                     self.weight_quantizer,
-                    self.adaround_V,
+                    self.adaround_A1,
+                    self.adaround_A2,
                     self.adaround_zeta.item(),
                     self.adaround_gamma.item()
                 )

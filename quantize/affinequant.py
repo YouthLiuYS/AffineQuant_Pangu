@@ -14,54 +14,68 @@ import pdb
 import gc
 
 
-def adaround_reg_loss(V, zeta, gamma, beta):
+def adaround_reg_loss(A1, A2, zeta, gamma, beta):
     """
-    Compute AdaRound regularization loss L_com.
+    Compute LoRA-AdaRound regularization loss L_com.
+    V = A1 @ A2
     L_com = sum(1 - |2 * h(V) - 1|^beta)
     where h(V) = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
     """
+    V = A1 @ A2
     h = torch.clamp(torch.sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
     reg = 1 - torch.pow((2 * h - 1).abs(), beta)
     return reg.sum()
 
 
-def get_adaround_h(V, zeta, gamma, hard=False):
+def get_adaround_h(A1, A2, zeta, gamma, hard=False):
     """
-    Compute AdaRound soft/hard rounding offset h(V).
+    Compute LoRA-AdaRound soft/hard rounding offset h(V).
+    V = A1 @ A2
     h = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
     If hard=True, return (h >= 0.5).float()
     """
+    V = A1 @ A2
     h = torch.clamp(torch.sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
     if hard:
         h = (h >= 0.5).float()
     return h
 
 
-def init_adaround_params_for_module(module, name, adaround_params, init_bias, zeta, gamma, dev, dtype):
+def init_adaround_params_for_module(module, name, adaround_params, init_bias, zeta, gamma, rank, dev, dtype):
     """
-    Initialize AdaRound parameters for a QuantLinear module.
-    Use loaded params from adaround_params if available, otherwise use init_bias.
-    Returns the V parameter tensor.
+    Initialize LoRA-AdaRound parameters for a QuantLinear module.
+    V = A1 @ A2 where A1: (out_features, rank), A2: (rank, in_features)
+    A1: Gaussian random init, A2: zero init (so initial V = 0, h = 0.5 = round-to-nearest)
+    Returns tuple (A1, A2) parameter tensors.
     """
     if hasattr(module, 'adaround_enabled') and module.adaround_enabled:
-        return module.adaround_V
+        return module.adaround_A1, module.adaround_A2
 
-    weight = module.weight
+    out_features, in_features = module.weight.shape
 
-    # Determine V initialization: load from params or use init_bias
-    if adaround_params is not None and name in adaround_params:
-        V_init = adaround_params[name].to(device=dev, dtype=dtype)
+    # LoRA-style decomposition: V = A1 @ A2
+    # A1: (out_features, rank) - Gaussian random init
+    # A2: (rank, in_features) - zero init
+    # Initial V = A1 @ A2 = 0, so h = sigmoid(0) * (zeta - gamma) + gamma = 0.5
+    if adaround_params is not None and f"{name}.A1" in adaround_params:
+        A1_init = adaround_params[f"{name}.A1"].to(device=dev, dtype=dtype)
+        A2_init = adaround_params[f"{name}.A2"].to(device=dev, dtype=dtype)
+        # Infer rank from loaded A1 matrix shape
+        actual_rank = A1_init.shape[1]
     else:
-        # Use constant init_bias (default 0.0 gives h=0.5, i.e. round-to-nearest)
-        V_init = torch.full_like(weight, init_bias, dtype=dtype)
+        A1_init = torch.randn(out_features, rank, device=dev, dtype=dtype) * 0.01
+        A2_init = torch.zeros(rank, in_features, device=dev, dtype=dtype)
+        actual_rank = rank
 
-    # Register as parameter
-    module.register_parameter('adaround_V', nn.Parameter(V_init))
+    # Register as parameters
+    module.register_parameter('adaround_A1', nn.Parameter(A1_init))
+    module.register_parameter('adaround_A2', nn.Parameter(A2_init))
     module.register_buffer('adaround_zeta', torch.tensor(zeta, device=dev, dtype=dtype))
     module.register_buffer('adaround_gamma', torch.tensor(gamma, device=dev, dtype=dtype))
+    module.register_buffer('adaround_rank', torch.tensor(actual_rank, device=dev))
     module.adaround_enabled = True
 
-    return module.adaround_V
+    return module.adaround_A1, module.adaround_A2
 
 
 
@@ -264,20 +278,20 @@ def affinequant(
         do_adaround = getattr(args, 'adaround', False) and (getattr(args, 'adaround_layer_idx', None) is None or i == args.adaround_layer_idx)
 
         # === Initialize AdaRound params BEFORE training (for joint optimization) ===
-        adaround_V_list = []
-        adaround_module_info = []  # (full_name, module, V)
+        adaround_params_list = []  # List of (A1, A2) tuples for optimizer
+        adaround_module_info = []  # (full_name, module, A1, A2)
         if do_adaround and args.epochs > 0 and not (args.resume and i < len(affine_parameters)):
-            logger.info(f"=== Initializing AdaRound for joint optimization in layer {i} ===")
+            logger.info(f"=== Initializing LoRA-AdaRound (rank={args.adaround_rank}) for joint optimization in layer {i} ===")
             named_linears = get_named_linears(qlayer)
             for sub_name, module in named_linears.items():
                 full_name = f"{layer_name_prefix}.{i}.{sub_name}"
-                V = init_adaround_params_for_module(
+                A1, A2 = init_adaround_params_for_module(
                     module, full_name, adaround_params,
                     args.adaround_init_bias, args.adaround_zeta, args.adaround_gamma,
-                    dev, args.dtype
+                    args.adaround_rank, dev, args.dtype
                 )
-                adaround_V_list.append(V)
-                adaround_module_info.append((full_name, module, V))
+                adaround_params_list.extend([A1, A2])
+                adaround_module_info.append((full_name, module, A1, A2))
                 # Enable adaround mode in quantizer for forward pass
                 module.weight_quantizer.adaround_mode = True
 
@@ -285,13 +299,13 @@ def affinequant(
             with torch.no_grad():
                 qlayer.to(args.dtype)      # required for AMP training
 
-            # create optimizer (include adaround V params if enabled for joint optimization)
+            # create optimizer (include adaround A1/A2 params if enabled for joint optimization)
             optimizer_param_groups = [
                 {"params": qlayer.let_parameters(use_shift), "lr": args.let_lr},
                 {"params": qlayer.lwc_parameters(), "lr": args.lwc_lr}
             ]
-            if do_adaround and len(adaround_V_list) > 0:
-                optimizer_param_groups.append({"params": adaround_V_list, "lr": args.adaround_lr})
+            if do_adaround and len(adaround_params_list) > 0:
+                optimizer_param_groups.append({"params": adaround_params_list, "lr": args.adaround_lr})
             optimizer = torch.optim.AdamW(optimizer_param_groups, weight_decay=args.wd)
             loss_scaler = utils.NativeScalerWithGradNormCount()
 
@@ -361,9 +375,9 @@ def affinequant(
                         # AdaRound regularization loss L_com (joint optimization)
                         if do_adaround and len(adaround_module_info) > 0:
                             reg_loss = 0
-                            for _, module, V in adaround_module_info:
+                            for _, module, A1, A2 in adaround_module_info:
                                 reg_loss += adaround_reg_loss(
-                                    V, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
+                                    A1, A2, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
                                 )
                             loss = recon_loss + adaround_reg_coef * reg_loss
                             reg_loss_list.append(reg_loss.data if isinstance(reg_loss, torch.Tensor) else torch.tensor(reg_loss))
@@ -376,10 +390,10 @@ def affinequant(
 
                     loss_list.append(loss.data)
                     optimizer.zero_grad()
-                    # Include adaround V params in gradient update
+                    # Include adaround A1/A2 params in gradient update
                     all_params = list(qlayer.affine_parameters(use_shift))
                     if do_adaround:
-                        all_params.extend(adaround_V_list)
+                        all_params.extend(adaround_params_list)
                     norm = loss_scaler(loss, optimizer, parameters=all_params)
                     norm_list.append(norm.data)
 
@@ -441,24 +455,25 @@ def affinequant(
         # === AdaRound Hardening (after joint training) ===
         # Only run if --adaround is enabled and training was performed
         if do_adaround and len(adaround_module_info) > 0:
-            logger.info(f"=== AdaRound hardening for layer {i} (after joint training) ===")
+            logger.info(f"=== LoRA-AdaRound hardening for layer {i} (after joint training) ===")
 
-            # Save adaround parameters before hardening
+            # Save adaround parameters before hardening (A1 and A2 separately)
             adaround_save_dict = {}
-            for full_name, module, V in adaround_module_info:
-                adaround_save_dict[full_name] = V.detach().cpu().clone()
+            for full_name, module, A1, A2 in adaround_module_info:
+                adaround_save_dict[f"{full_name}.A1"] = A1.detach().cpu().clone()
+                adaround_save_dict[f"{full_name}.A2"] = A2.detach().cpu().clone()
             adaround_save_path = os.path.join(args.output_dir, f"adaround_params_layer{i}.pth")
             torch.save(adaround_save_dict, adaround_save_path)
-            logger.info(f"Saved adaround params to {adaround_save_path}")
+            logger.info(f"Saved LoRA-AdaRound params to {adaround_save_path}")
 
             # Hardening: apply hard rounding and write back to weights
             with torch.no_grad():
-                for full_name, module, V in adaround_module_info:
+                for full_name, module, A1, A2 in adaround_module_info:
                     # Disable adaround mode in quantizer
                     module.weight_quantizer.adaround_mode = False
 
-                    # Compute hard h
-                    h_hard = get_adaround_h(V, module.adaround_zeta.item(),
+                    # Compute hard h from V = A1 @ A2
+                    h_hard = get_adaround_h(A1, A2, module.adaround_zeta.item(),
                                             module.adaround_gamma.item(), hard=True)
 
                     # Use current weight (already smoothed) for final quantization
@@ -514,15 +529,17 @@ def affinequant(
                     # IMPORTANT: Disable weight quantization since weight is already quantized
                     module.use_weight_quant = False
 
-                    # Clean up adaround params
-                    del module.adaround_V
+                    # Clean up adaround params (A1, A2 instead of V)
+                    del module.adaround_A1
+                    del module.adaround_A2
                     del module.adaround_zeta
                     del module.adaround_gamma
+                    del module.adaround_rank
                     module.adaround_enabled = False
 
             # Set quant state: disable weight quant since weights are already quantized
             qlayer.set_quant_state(weight_quant=False, act_quant=True)
-            logger.info(f"=== AdaRound hardening done for layer {i} ===")
+            logger.info(f"=== LoRA-AdaRound hardening done for layer {i} ===")
 
         if args.epochs>0:
             # update input of quantization model
