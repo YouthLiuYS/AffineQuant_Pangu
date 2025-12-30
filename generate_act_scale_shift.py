@@ -99,7 +99,7 @@ def get_act_shifts(model, dataloader, num_samples=128):
     return act_shifts
 
 
-def get_adaround(model, init_bias=-5.0, zeta=1.1, gamma=-0.1):
+def get_adaround(model, init_bias=0.0, zeta=1.1, gamma=-0.1):
     """
     Initialize AdaRound parameters (V matrix) for linear layers.
     For AutoModelForCausalLM (nn.Linear), generates parameter dict only.
@@ -147,8 +147,8 @@ def parse_args():
     # AdaRound parameters
     parser.add_argument('--adaround-output-path', type=str, default='./adaround_params/',
                         help='where to save the adaround parameters')
-    parser.add_argument('--adaround-init-bias', type=float, default=-5.0,
-                        help='initial bias for adaround V matrix')
+    parser.add_argument('--adaround-init-bias', type=float, default=0.0,
+                        help='initial bias for adaround V matrix (0.0 gives h=0.5, i.e. round-to-nearest)')
     parser.add_argument('--adaround-zeta', type=float, default=1.1,
                         help='zeta parameter for adaround rectified sigmoid')
     parser.add_argument('--adaround-gamma', type=float, default=-0.1,

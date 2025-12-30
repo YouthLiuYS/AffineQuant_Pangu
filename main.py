@@ -369,10 +369,10 @@ def main():
                         help="only apply adaround to specific layer index")
     parser.add_argument("--adaround-epochs", type=int, default=5,
                         help="number of epochs for adaround training")
-    parser.add_argument("--adaround-lr", type=float, default=1e-2,
+    parser.add_argument("--adaround-lr", type=float, default=1e-4,
                         help="learning rate for adaround training")
-    parser.add_argument("--adaround-init-bias", type=float, default=-5.0,
-                        help="initial bias for adaround V matrix")
+    parser.add_argument("--adaround-init-bias", type=float, default=0.0,
+                        help="initial bias for adaround V matrix (0.0 gives h=0.5, i.e. round-to-nearest)")
     parser.add_argument("--adaround-zeta", type=float, default=1.1,
                         help="zeta parameter for adaround rectified sigmoid")
     parser.add_argument("--adaround-gamma", type=float, default=-0.1,
@@ -381,7 +381,7 @@ def main():
                         help="starting beta for adaround regularization annealing")
     parser.add_argument("--adaround-beta-end", type=float, default=2.0,
                         help="ending beta for adaround regularization annealing")
-    parser.add_argument("--adaround-reg", type=float, default=0.01,
+    parser.add_argument("--adaround-reg", type=float, default=1e-4,
                         help="regularization coefficient for adaround")
 
     args = parser.parse_args()

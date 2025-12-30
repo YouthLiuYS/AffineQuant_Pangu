@@ -4,13 +4,23 @@ import torch.nn.functional as F
 from quantize.quantizer import UniformAffineQuantizer
 
 
+def floor_ste(x: torch.Tensor):
+    """
+    Implement Straight-Through Estimator for floor operation.
+    Forward: floor(x), Backward: gradient passes through as identity.
+    """
+    return (x.floor() - x).detach() + x
+
+
 def adaround_fake_quant(x, quantizer, V, zeta, gamma):
     """
     Perform AdaRound quantization with soft rounding.
-    x: input weight tensor
+    x: input weight tensor (smoothed weight from LET/LWC)
     quantizer: UniformAffineQuantizer instance
     V: learnable rounding parameter (same shape as x)
     zeta, gamma: rectified sigmoid parameters
+
+    Uses STE for floor operation to allow gradient flow to LET/LWC parameters.
     """
     deficiency = quantizer.deficiency
     group_size = quantizer.group_size
@@ -39,9 +49,10 @@ def adaround_fake_quant(x, quantizer, V, zeta, gamma):
     scale = quantizer.scale
     round_zero_point = quantizer.round_zero_point
 
-    # AdaRound soft rounding: floor(x/scale) + h(V)
+    # AdaRound soft rounding: floor_ste(x/scale) + h(V)
     # h(V) = clamp(sigmoid(V) * (zeta - gamma) + gamma, 0, 1)
-    x_floor = torch.floor(x_reshaped / scale)
+    # Use floor_ste to allow gradient flow to LET/LWC parameters through x
+    x_floor = floor_ste(x_reshaped / scale)
     h = torch.clamp(torch.sigmoid(V_reshaped) * (zeta - gamma) + gamma, 0, 1)
     x_int = x_floor + h
 

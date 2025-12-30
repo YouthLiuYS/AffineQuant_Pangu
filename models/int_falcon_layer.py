@@ -326,7 +326,7 @@ class QuantFalconDecoderLayer(nn.Module):
                 m.set_quant_state(weight_quant, act_quant)
 
     @torch.no_grad()
-    def smooth_and_quant_inplace(self, num_heads=None, maskqkv=None, maskfc=None, use_matrix=False, use_ln_matrix=False, save_smooth_weight=False):
+    def smooth_and_quant_inplace(self, num_heads=None, maskqkv=None, maskfc=None, use_matrix=False, use_ln_matrix=False, save_smooth_weight=False, skip_quant=False):
         if self.let:
             raise ValueError("falcon not yet support let")
         # Save smooth weights before quantization (for AdaRound initialization)
@@ -334,6 +334,12 @@ class QuantFalconDecoderLayer(nn.Module):
             for name, module in self.named_modules():
                 if isinstance(module, QuantLinear):
                     module.smooth_weight = module.weight.clone()
+        # Skip quantization if adaround will handle it (hardening does the final quant)
+        if skip_quant:
+            for name, module in self.named_modules():
+                if isinstance(module, QuantLinear):
+                    module.use_temporary_parameter = False
+            return
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 module.weight = module.weight_quantizer(module.weight)
@@ -357,9 +363,22 @@ class QuantFalconDecoderLayer(nn.Module):
         for name, module in self.named_modules():
             if isinstance(module, QuantLinear):
                 if hasattr(module, "temp_weight"):
-                    module.temp_weight = module.weight_quantizer(module.temp_weight)
+                    w_to_quant = module.temp_weight
                 else:
-                    module.temp_weight = module.weight_quantizer(module.weight)
+                    w_to_quant = module.weight
+                # Use adaround_fake_quant when adaround is enabled (joint optimization)
+                if (module.weight_quantizer.adaround_mode and
+                    hasattr(module, 'adaround_enabled') and module.adaround_enabled):
+                    from quantize.int_linear import adaround_fake_quant
+                    module.temp_weight = adaround_fake_quant(
+                        w_to_quant,
+                        module.weight_quantizer,
+                        module.adaround_V,
+                        module.adaround_zeta.item(),
+                        module.adaround_gamma.item()
+                    )
+                else:
+                    module.temp_weight = module.weight_quantizer(w_to_quant)
                 if not hasattr(module, "temp_bias"):
                     module.temp_bias = module.bias
                 module.use_temporary_parameter=True
