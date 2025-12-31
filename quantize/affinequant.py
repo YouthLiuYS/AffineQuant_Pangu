@@ -299,36 +299,37 @@ def affinequant(
             with torch.no_grad():
                 qlayer.to(args.dtype)      # required for AMP training
 
-            # create optimizer (include adaround A1/A2 params if enabled for joint optimization)
-            optimizer_param_groups = [
+            # Create separate optimizers for AffineQuant and AdaRound (alternating training)
+            affine_optimizer = torch.optim.AdamW([
                 {"params": qlayer.let_parameters(use_shift), "lr": args.let_lr},
                 {"params": qlayer.lwc_parameters(), "lr": args.lwc_lr}
-            ]
+            ], weight_decay=args.wd)
+
             if do_adaround and len(adaround_params_list) > 0:
-                optimizer_param_groups.append({"params": adaround_params_list, "lr": args.adaround_lr})
-            optimizer = torch.optim.AdamW(optimizer_param_groups, weight_decay=args.wd)
+                adaround_optimizer = torch.optim.AdamW([
+                    {"params": adaround_params_list, "lr": args.adaround_lr}
+                ], weight_decay=args.wd)
+                adaround_inner_epochs = getattr(args, 'adaround_inner_epochs', 3)
+            else:
+                adaround_optimizer = None
+                adaround_inner_epochs = 0
+
             loss_scaler = utils.NativeScalerWithGradNormCount()
 
             # Beta annealing parameters for AdaRound regularization
             beta_start = args.adaround_beta_start if do_adaround else 20.0
             beta_end = args.adaround_beta_end if do_adaround else 2.0
             adaround_reg_coef = args.adaround_reg if do_adaround else 0.01
-            
+
+            # Total AdaRound epochs for beta annealing calculation
+            total_adaround_epochs = args.epochs * adaround_inner_epochs if do_adaround else 1
+            adaround_epoch_counter = 0
+
             for epochs in range(args.epochs):
-                loss_list = []
-                norm_list = []
-                reg_loss_list = []  # For tracking AdaRound reg loss
+                # gradual mask (same for both phases)
+                qkvmask_num = int((lm.model.config.hidden_size-1)/(args.epochs-1)*epochs)+1 if args.epochs > 1 else lm.model.config.hidden_size
+                fc1mask_num = int((lm.model.config.hidden_size/lm.model.config.num_attention_heads-1)/(args.epochs-1)*epochs)+1 if args.epochs > 1 else lm.model.config.hidden_size//lm.model.config.num_attention_heads
 
-                # Compute current beta for AdaRound regularization (annealing)
-                if do_adaround and args.epochs > 1:
-                    beta = beta_start + (beta_end - beta_start) * epochs / (args.epochs - 1)
-                else:
-                    beta = beta_end
-
-                # gradual mask
-                qkvmask_num = int((lm.model.config.hidden_size-1)/(args.epochs-1)*epochs)+1
-                fc1mask_num = int((lm.model.config.hidden_size/lm.model.config.num_attention_heads-1)/(args.epochs-1)*epochs)+1
-                
                 values = torch.tensor([1 for i1 in range(qlayer.self_attn.q_proj.weight.data.size(1))]).cuda()
                 maskqkv = torch.zeros(qlayer.self_attn.q_proj.weight.data.size(1), qlayer.self_attn.q_proj.weight.data.size(1)).cuda()
                 for i1 in range(qkvmask_num):
@@ -340,14 +341,14 @@ def affinequant(
                         mask2 = torch.diag(args.sf*values[:len(values)-i1], -i1)
                     maskqkv = maskqkv + mask1 + mask2
                 maskqkv = maskqkv - torch.eye(qlayer.self_attn.q_proj.weight.data.size(1)).cuda()
-                
+
                 if "opt" in args.net.lower():
                     maskfc = torch.zeros([qlayer.self_attn.out_proj.weight.data.size(0), qlayer.self_attn.out_proj.weight.data.size(1)]).cuda()
                     head_size = qlayer.self_attn.out_proj.weight.data.size(0)//lm.model.config.num_attention_heads
                 elif "llama" in args.net.lower():
                     maskfc = torch.zeros([qlayer.self_attn.o_proj.weight.data.size(0), qlayer.self_attn.o_proj.weight.data.size(1)]).cuda()
                     head_size = qlayer.self_attn.o_proj.weight.data.size(0)//lm.model.config.num_attention_heads
-                
+
                 values1 = torch.tensor([1 for i1 in range(head_size)]).cuda()
                 ones = torch.zeros(head_size, head_size).cuda()
                 for i1 in range(fc1mask_num):
@@ -361,52 +362,84 @@ def affinequant(
                 ones = ones - torch.eye(head_size).cuda()
                 for i1 in range(lm.model.config.num_attention_heads):
                     maskfc[i1*head_size:(i1+1)*head_size, i1*head_size:(i1+1)*head_size] = ones
-                    
+
+                # ============ Phase 1: Train AffineQuant (LET/LWC) for 1 epoch ============
+                loss_list = []
+                norm_list = []
+
                 for j in range(args.nsamples//args.batch_size):
                     index = j * args.batch_size
-                    # obtain output of quantization model
                     with traincast():
                         qlayer.smooth_and_quant_temporary(lm.model.config.num_attention_heads, maskqkv, maskfc, use_matrix=use_matrix, use_ln_matrix=use_ln_matrix)
                         quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
-                        recon_loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                        loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
-                            recon_loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
-
-                        # AdaRound regularization loss L_com (joint optimization)
-                        if do_adaround and len(adaround_module_info) > 0:
-                            reg_loss = 0
-                            for _, module, A1, A2 in adaround_module_info:
-                                reg_loss += adaround_reg_loss(
-                                    A1, A2, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
-                                )
-                            loss = recon_loss + adaround_reg_coef * reg_loss
-                            reg_loss_list.append(reg_loss.data if isinstance(reg_loss, torch.Tensor) else torch.tensor(reg_loss))
-                        else:
-                            loss = recon_loss
+                            loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
 
                     if not math.isfinite(loss.item()):
                         logger.info("Loss is NAN, stopping training")
                         pdb.set_trace()
 
                     loss_list.append(loss.data)
-                    optimizer.zero_grad()
-                    # Include adaround A1/A2 params in gradient update
-                    all_params = list(qlayer.affine_parameters(use_shift))
-                    if do_adaround:
-                        all_params.extend(adaround_params_list)
-                    norm = loss_scaler(loss, optimizer, parameters=all_params)
+                    affine_optimizer.zero_grad()
+                    norm = loss_scaler(loss, affine_optimizer, parameters=list(qlayer.affine_parameters(use_shift)))
                     norm_list.append(norm.data)
 
                 loss_mean = torch.stack(loss_list).mean()
                 norm_mean = torch.stack(norm_list).mean()
-                if do_adaround and len(reg_loss_list) > 0:
-                    reg_mean = torch.stack(reg_loss_list).mean()
-                    logger.info(f"layer {i} iter {epochs} recon_loss:{recon_loss} reg_loss:{reg_mean:.6f} beta:{beta:.2f} norm:{norm_mean} mem:{torch.cuda.max_memory_allocated(lm._device) / 1024**2}MB")
-                else:
-                    logger.info(f"layer {i} iter {epochs} loss:{loss_mean} norm:{norm_mean} max memory_allocated {torch.cuda.max_memory_allocated(lm._device) / 1024**2} ")
+                logger.info(f"layer {i} epoch {epochs} [AffineQuant] loss:{loss_mean:.6f} norm:{norm_mean:.8f} mem:{torch.cuda.max_memory_allocated(lm._device) / 1024**2:.1f}MB")
+
+                # ============ Phase 2: Train LoRA-AdaRound for inner_epochs ============
+                if do_adaround and adaround_optimizer is not None:
+                    for inner_epoch in range(adaround_inner_epochs):
+                        loss_list = []
+                        norm_list = []
+                        reg_loss_list = []
+
+                        # Compute current beta for AdaRound regularization (annealing across all adaround epochs)
+                        if total_adaround_epochs > 1:
+                            beta = beta_start + (beta_end - beta_start) * adaround_epoch_counter / (total_adaround_epochs - 1)
+                        else:
+                            beta = beta_end
+
+                        for j in range(args.nsamples//args.batch_size):
+                            index = j * args.batch_size
+                            with traincast():
+                                qlayer.smooth_and_quant_temporary(lm.model.config.num_attention_heads, maskqkv, maskfc, use_matrix=use_matrix, use_ln_matrix=use_ln_matrix)
+                                quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                                recon_loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
+                                if args.aug_loss:
+                                    recon_loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
+
+                                # AdaRound regularization loss L_com
+                                reg_loss = 0
+                                for _, module, A1, A2 in adaround_module_info:
+                                    reg_loss += adaround_reg_loss(
+                                        A1, A2, module.adaround_zeta.item(), module.adaround_gamma.item(), beta
+                                    )
+                                loss = recon_loss + adaround_reg_coef * reg_loss
+                                reg_loss_list.append(reg_loss.data if isinstance(reg_loss, torch.Tensor) else torch.tensor(reg_loss))
+
+                            if not math.isfinite(loss.item()):
+                                logger.info("Loss is NAN, stopping training")
+                                pdb.set_trace()
+
+                            loss_list.append(loss.data)
+                            adaround_optimizer.zero_grad()
+                            norm = loss_scaler(loss, adaround_optimizer, parameters=adaround_params_list)
+                            norm_list.append(norm.data)
+
+                        loss_mean = torch.stack(loss_list).mean()
+                        norm_mean = torch.stack(norm_list).mean()
+                        reg_mean = torch.stack(reg_loss_list).mean()
+                        logger.info(f"layer {i} epoch {epochs} [AdaRound {inner_epoch+1}/{adaround_inner_epochs}] loss:{loss_mean:.6f} reg:{reg_mean:.6f} beta:{beta:.2f} norm:{norm_mean:.4f}")
+
+                        adaround_epoch_counter += 1
 
             qlayer.clear_temp_variable()
-            del optimizer
+            del affine_optimizer
+            if adaround_optimizer is not None:
+                del adaround_optimizer
 
         if args.resume and i < len(affine_parameters):
             qkvmask_num = lm.model.config.hidden_size

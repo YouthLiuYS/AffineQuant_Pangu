@@ -333,8 +333,8 @@ def main():
     parser.add_argument("--abits", type=int, default=4)
     parser.add_argument("--group_size", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=0.5)
-    parser.add_argument("--let_lr", type=float, default=5e-3)
-    parser.add_argument("--lwc_lr", type=float, default=1e-2)
+    parser.add_argument("--let_lr", type=float, default=1e-4)
+    parser.add_argument("--lwc_lr", type=float, default=5e-3)
     parser.add_argument("--wd", type=float, default=0)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--let",default=False, action="store_true",help="activate learnable equivalent transformation")
@@ -369,7 +369,7 @@ def main():
                         help="only apply adaround to specific layer index")
     parser.add_argument("--adaround-epochs", type=int, default=5,
                         help="number of epochs for adaround training")
-    parser.add_argument("--adaround-lr", type=float, default=5e-3,
+    parser.add_argument("--adaround-lr", type=float, default=4e-4,
                         help="learning rate for adaround training")
     parser.add_argument("--adaround-init-bias", type=float, default=0.0,
                         help="initial bias for adaround V matrix (0.0 gives h=0.5, i.e. round-to-nearest)")
@@ -381,10 +381,12 @@ def main():
                         help="starting beta for adaround regularization annealing")
     parser.add_argument("--adaround-beta-end", type=float, default=30.0,
                         help="ending beta for adaround regularization annealing")
-    parser.add_argument("--adaround-reg", type=float, default=1e-10,
+    parser.add_argument("--adaround-reg", type=float, default=1e-11,
                         help="regularization coefficient for adaround")
     parser.add_argument("--adaround-rank", type=int, default=16,
                         help="rank for LoRA-AdaRound decomposition (V = A1 @ A2)")
+    parser.add_argument("--adaround-inner-epochs", type=int, default=3,
+                        help="number of LoRA-AdaRound epochs per AffineQuant epoch (alternating training)")
 
     args = parser.parse_args()
     random.seed(args.seed)
